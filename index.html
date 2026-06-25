@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AV-SynthRestore 3D</title>
+
+  <!-- Typography: Rajdhani (UI) + JetBrains Mono (telemetry) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet" />
+
+  <!-- Three.js importmap -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    /* ── Reset & Root ──────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg-void:    #020a12;
+      --bg-deep:    #040d18;
+      --bg-panel:   #07141f;
+      --bg-surface: #0b1d2c;
+      --bg-hover:   #0f2538;
+      --border:     #152b3f;
+      --border-hi:  #1e4060;
+
+      --c-cyan:     #00e5ff;
+      --c-cyan-dim: #007a8c;
+      --c-amber:    #ff8c00;
+      --c-amber-dim:#7a4200;
+      --c-violet:   #b400ff;
+      --c-violet-dim:#5a0080;
+      --c-green:    #00e676;
+      --c-green-dim:#006633;
+      --c-red:      #ff1744;
+      --c-text:     #b8d4e8;
+      --c-text-dim: #4a7090;
+      --c-text-hi:  #e0f0ff;
+
+      --font-ui:   'Rajdhani', 'Arial Narrow', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+
+      --panel-w-left:  260px;
+      --panel-w-right: 220px;
+      --header-h:      46px;
+      --footer-h:      50px;
+
+      --transition: 180ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: var(--bg-void);
+      color: var(--c-text);
+      font-family: var(--font-ui);
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── App Shell Grid ────────────────────────────────────────────────────── */
+    #app {
+      display: grid;
+      width: 100vw; height: 100vh;
+      grid-template-columns: var(--panel-w-left) 1fr var(--panel-w-right);
+      grid-template-rows: var(--header-h) 1fr var(--footer-h);
+      grid-template-areas:
+        "header  header  header"
+        "left    canvas  right"
+        "footer  footer  footer";
+    }
+
+    /* ── Header ────────────────────────────────────────────────────────────── */
+    #header {
+      grid-area: header;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      z-index: 10;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .brand-icon {
+      width: 26px; height: 26px;
+      display: grid;
+      place-items: center;
+    }
+    .brand-icon svg { width: 100%; height: 100%; }
+    .brand-name {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 0.12em;
+      color: var(--c-cyan);
+      text-shadow: 0 0 12px rgba(0, 229, 255, 0.5);
+    }
+    .brand-ver {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--c-text-dim);
+      letter-spacing: 0.06em;
+      margin-top: 1px;
+    }
+
+    .header-center {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+    .job-badge {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      color: var(--c-text-dim);
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 2px;
+    }
+    .job-badge span {
+      color: var(--c-cyan);
+      font-weight: 500;
+    }
+
+    .ws-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      color: var(--c-text-dim);
+    }
+    .ws-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--c-text-dim);
+      transition: background var(--transition), box-shadow var(--transition);
+    }
+    .ws-dot.connected {
+      background: var(--c-green);
+      box-shadow: 0 0 8px var(--c-green);
+    }
+    .ws-dot.error {
+      background: var(--c-red);
+      box-shadow: 0 0 8px var(--c-red);
+      animation: blink 1s infinite;
+    }
+
+    /* ── Left Panel ─────────────────────────────────────────────────────────── */
+    #panel-left {
+      grid-area: left;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+    #panel-left::-webkit-scrollbar { width: 3px; }
+    #panel-left::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+    /* Scanline atmosphere on left panel */
+    #panel-left::before {
+      content: '';
+      position: absolute;
+      left: 0; top: var(--header-h);
+      width: var(--panel-w-left);
+      height: calc(100vh - var(--header-h) - var(--footer-h));
+      background: repeating-linear-gradient(
+        to bottom,
+        transparent 0px,
+        transparent 3px,
+        rgba(0, 229, 255, 0.008) 3px,
+        rgba(0, 229, 255, 0.008) 4px
+      );
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    .panel-section {
+      padding: 14px 14px 12px;
+      border-bottom: 1px solid var(--border);
+      position: relative;
+      z-index: 2;
+    }
+    .section-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      color: var(--c-text-dim);
+      text-transform: uppercase;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-label::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* File drop zone */
+    #drop-zone {
+      border: 1px dashed var(--border-hi);
+      border-radius: 3px;
+      padding: 18px 12px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color var(--transition), background var(--transition);
+      background: transparent;
+    }
+    #drop-zone:hover, #drop-zone.drag-over {
+      border-color: var(--c-cyan);
+      background: rgba(0, 229, 255, 0.04);
+    }
+    #drop-zone .dz-icon {
+      font-size: 22px;
+      margin-bottom: 6px;
+      opacity: 0.6;
+    }
+    #drop-zone .dz-text {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--c-text-dim);
+      line-height: 1.6;
+    }
+    #drop-zone .dz-text strong {
+      color: var(--c-cyan);
+      font-weight: 500;
+    }
+    #file-name {
+      margin-top: 8px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--c-green);
+      word-break: break-all;
+      min-height: 14px;
+    }
+    #file-input { display: none; }
+
+    /* Control buttons */
+    .btn {
+      width: 100%;
+      padding: 9px 12px;
+      border: 1px solid var(--border-hi);
+      border-radius: 2px;
+      background: transparent;
+      color: var(--c-text);
+      font-family: var(--font-ui);
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all var(--transition);
+      margin-top: 8px;
+    }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .btn-primary {
+      border-color: var(--c-cyan);
+      color: var(--c-cyan);
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: rgba(0, 229, 255, 0.1);
+      box-shadow: 0 0 14px rgba(0, 229, 255, 0.2);
+    }
+    .btn-success {
+      border-color: var(--c-green);
+      color: var(--c-green);
+    }
+    .btn-success:hover:not(:disabled) {
+      background: rgba(0, 230, 118, 0.1);
+      box-shadow: 0 0 14px rgba(0, 230, 118, 0.2);
+    }
+    .btn-process {
+      border-color: var(--c-amber);
+      color: var(--c-amber);
+    }
+    .btn-process:hover:not(:disabled) {
+      background: rgba(255, 140, 0, 0.1);
+      box-shadow: 0 0 14px rgba(255, 140, 0, 0.25);
+    }
+    .btn-process.running {
+      animation: pulse-amber 1.4s infinite;
+    }
+
+    /* Pipeline stage list */
+    .stage-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    .stage-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 4px;
+      border-bottom: 1px solid rgba(21, 43, 63, 0.5);
+      transition: all var(--transition);
+    }
+    .stage-item:last-child { border-bottom: none; }
+    .stage-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      border: 1px solid var(--c-text-dim);
+      background: transparent;
+      flex-shrink: 0;
+      transition: all var(--transition);
+    }
+    .stage-item.active .stage-dot {
+      background: var(--c-cyan);
+      border-color: var(--c-cyan);
+      box-shadow: 0 0 8px var(--c-cyan);
+      animation: pulse-dot 1.2s infinite;
+    }
+    .stage-item.complete .stage-dot {
+      background: var(--c-green);
+      border-color: var(--c-green);
+      box-shadow: 0 0 6px var(--c-green);
+    }
+    .stage-item.error .stage-dot {
+      background: var(--c-red);
+      border-color: var(--c-red);
+    }
+    .stage-info { flex: 1; min-width: 0; }
+    .stage-name {
+      font-family: var(--font-ui);
+      font-weight: 600;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      color: var(--c-text-dim);
+      transition: color var(--transition);
+    }
+    .stage-item.active .stage-name { color: var(--c-text-hi); }
+    .stage-item.complete .stage-name { color: var(--c-green); }
+    .stage-sub {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-text-dim);
+      margin-top: 1px;
+    }
+    .stage-pct {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--c-text-dim);
+      transition: color var(--transition);
+    }
+    .stage-item.active .stage-pct { color: var(--c-cyan); }
+    .stage-item.complete .stage-pct { color: var(--c-green); }
+
+    /* ── Canvas Area ─────────────────────────────────────────────────────────── */
+    #canvas-wrap {
+      grid-area: canvas;
+      position: relative;
+      background: var(--bg-void);
+      overflow: hidden;
+    }
+    #three-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100% !important;
+      height: 100% !important;
+    }
+
+    /* Node labels overlay */
+    #node-labels {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 5;
+    }
+    .node-label {
+      position: absolute;
+      transform: translate(-50%, 0);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.14em;
+      color: var(--c-text-dim);
+      text-transform: uppercase;
+      padding: 3px 6px;
+      border: 1px solid transparent;
+      border-radius: 2px;
+      white-space: nowrap;
+      background: rgba(4, 13, 24, 0.7);
+      transition: color 0.3s, border-color 0.3s, text-shadow 0.3s;
+      pointer-events: none;
+    }
+    .node-label.active {
+      color: var(--c-cyan);
+      border-color: rgba(0, 229, 255, 0.3);
+      text-shadow: 0 0 8px rgba(0, 229, 255, 0.7);
+    }
+    .node-label.audio-active {
+      color: var(--c-amber);
+      border-color: rgba(255, 140, 0, 0.3);
+      text-shadow: 0 0 8px rgba(255, 140, 0, 0.7);
+    }
+    .node-label.video-active {
+      color: var(--c-violet);
+      border-color: rgba(180, 0, 255, 0.3);
+      text-shadow: 0 0 8px rgba(180, 0, 255, 0.7);
+    }
+    .node-label.complete {
+      color: var(--c-green);
+      border-color: rgba(0, 230, 118, 0.3);
+    }
+    .node-label-pct {
+      font-size: 10px;
+      font-weight: 700;
+      margin-top: 1px;
+    }
+
+    /* ── Right Panel ─────────────────────────────────────────────────────────── */
+    #panel-right {
+      grid-area: right;
+      background: var(--bg-panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      overflow-y: auto;
+    }
+    #panel-right::-webkit-scrollbar { width: 3px; }
+    #panel-right::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+    /* Telemetry meters */
+    .tel-group {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px 14px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .tel-item {}
+    .tel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 4px;
+    }
+    .tel-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.14em;
+      color: var(--c-text-dim);
+      text-transform: uppercase;
+    }
+    .tel-value {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--c-text-hi);
+      transition: color var(--transition);
+    }
+    .tel-value.cyan   { color: var(--c-cyan); }
+    .tel-value.amber  { color: var(--c-amber); }
+    .tel-value.violet { color: var(--c-violet); }
+    .tel-value.green  { color: var(--c-green); }
+
+    .tel-bar {
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .tel-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.4s ease-out;
+      background: var(--c-cyan);
+    }
+    .tel-bar-fill.amber  { background: var(--c-amber); }
+    .tel-bar-fill.violet { background: var(--c-violet); }
+    .tel-bar-fill.green  { background: var(--c-green); }
+    .tel-bar-fill.red    { background: var(--c-red); }
+
+    /* Large readout numbers */
+    .readout-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 14px 14px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .readout-cell {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 2px;
+      padding: 8px 8px 6px;
+    }
+    .readout-num {
+      font-family: var(--font-mono);
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--c-cyan);
+      line-height: 1;
+    }
+    .readout-lbl {
+      font-family: var(--font-mono);
+      font-size: 8px;
+      letter-spacing: 0.14em;
+      color: var(--c-text-dim);
+      text-transform: uppercase;
+      margin-top: 3px;
+    }
+
+    /* Log output */
+    #log-box {
+      flex: 1;
+      padding: 10px 14px;
+      overflow-y: auto;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      line-height: 1.7;
+    }
+    #log-box::-webkit-scrollbar { width: 3px; }
+    #log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .log-entry { color: var(--c-text-dim); }
+    .log-entry.info  { color: var(--c-cyan); }
+    .log-entry.warn  { color: var(--c-amber); }
+    .log-entry.error { color: var(--c-red); }
+    .log-entry.ok    { color: var(--c-green); }
+    .log-ts { opacity: 0.45; margin-right: 6px; }
+
+    /* ── Footer / Progress Bar ───────────────────────────────────────────────── */
+    #footer {
+      grid-area: footer;
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 14px;
+      z-index: 10;
+    }
+    .footer-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      color: var(--c-text-dim);
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
+    #overall-bar-wrap {
+      flex: 1;
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+    }
+    #overall-bar-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 3px;
+      background: linear-gradient(90deg, var(--c-cyan-dim), var(--c-cyan));
+      transition: width 0.5s ease-out;
+      box-shadow: 0 0 8px rgba(0, 229, 255, 0.6);
+    }
+    #overall-bar-fill.complete {
+      background: linear-gradient(90deg, var(--c-green-dim), var(--c-green));
+      box-shadow: 0 0 8px rgba(0, 230, 118, 0.6);
+    }
+    #overall-pct {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--c-cyan);
+      flex-shrink: 0;
+      min-width: 40px;
+      text-align: right;
+      transition: color var(--transition);
+    }
+    #overall-pct.complete { color: var(--c-green); }
+    #stage-text {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      color: var(--c-text-dim);
+      text-transform: uppercase;
+      flex-shrink: 0;
+      min-width: 140px;
+    }
+    .elapsed {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--c-text-dim);
+      flex-shrink: 0;
+    }
+
+    /* ── Animations ──────────────────────────────────────────────────────────── */
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.2; }
+    }
+    @keyframes pulse-dot {
+      0%, 100% { box-shadow: 0 0 4px var(--c-cyan); }
+      50% { box-shadow: 0 0 12px var(--c-cyan); }
+    }
+    @keyframes pulse-amber {
+      0%, 100% { box-shadow: none; }
+      50% { box-shadow: 0 0 12px rgba(255, 140, 0, 0.4); }
+    }
+
+    /* ── Misc ─────────────────────────────────────────────────────────────────── */
+    select {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hi);
+      color: var(--c-text);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      padding: 4px 8px;
+      border-radius: 2px;
+      outline: none;
+      width: 100%;
+      margin-top: 6px;
+      cursor: pointer;
+    }
+    select:focus { border-color: var(--c-cyan); }
+
+    .kv-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0;
+      border-bottom: 1px solid rgba(21, 43, 63, 0.4);
+    }
+    .kv-row:last-child { border-bottom: none; }
+    .kv-key {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      color: var(--c-text-dim);
+      text-transform: uppercase;
+    }
+    .kv-val {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--c-text);
+    }
+
+    .separator { height: 1px; background: var(--border); margin: 2px 0; }
+  </style>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ── Header ────────────────────────────────────────────────────────────── -->
+  <header id="header">
+    <div class="brand">
+      <div class="brand-icon">
+        <!-- Hexagon logo mark -->
+        <svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <polygon points="14,2 24,8 24,20 14,26 4,20 4,8"
+                   stroke="#00e5ff" stroke-width="1.5" fill="rgba(0,229,255,0.06)"/>
+          <polygon points="14,6 20,10 20,18 14,22 8,18 8,10"
+                   stroke="#00e5ff" stroke-width="0.8" fill="rgba(0,229,255,0.04)" opacity="0.6"/>
+          <line x1="14" y1="2" x2="14" y2="6" stroke="#00e5ff" stroke-width="0.8"/>
+          <line x1="24" y1="8" x2="20" y2="10" stroke="#00e5ff" stroke-width="0.8"/>
+          <line x1="24" y1="20" x2="20" y2="18" stroke="#00e5ff" stroke-width="0.8"/>
+          <circle cx="14" cy="14" r="2" fill="#00e5ff"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">AV-SYNTHRESTORE 3D</div>
+        <div class="brand-ver">v1.0.0 · AI Media Restoration Engine</div>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <div class="job-badge">JOB: <span id="hdr-job-id">—</span></div>
+      <div class="ws-status">
+        <div class="ws-dot" id="ws-dot"></div>
+        <span id="ws-label">DISCONNECTED</span>
+      </div>
+    </div>
+
+    <div style="width:200px; text-align:right;">
+      <div class="kv-row" style="border:none; padding:0; justify-content:flex-end; gap:16px;">
+        <span class="kv-key">GPU</span>
+        <span class="kv-val" id="hdr-gpu" style="color:var(--c-cyan)">—</span>
+        <span class="kv-key">TEMP</span>
+        <span class="kv-val" id="hdr-temp" style="color:var(--c-amber)">—</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Left Panel ─────────────────────────────────────────────────────────── -->
+  <aside id="panel-left">
+
+    <!-- File Load -->
+    <div class="panel-section">
+      <div class="section-label">Source File</div>
+      <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <div class="dz-icon">📁</div>
+        <div class="dz-text">Drop video or <strong>click to browse</strong><br/>MP4 · MKV · AVI · MOV · WEBM</div>
+      </div>
+      <div id="file-name"></div>
+      <input type="file" id="file-input" accept=".mp4,.mkv,.avi,.mov,.webm,.m4v" />
+    </div>
+
+    <!-- Actions -->
+    <div class="panel-section">
+      <div class="section-label">Actions</div>
+      <button class="btn btn-primary" id="btn-upload" disabled>⬆ Upload File</button>
+      <button class="btn btn-process" id="btn-process" disabled>▶ Start Restoration</button>
+      <button class="btn btn-success" id="btn-download" disabled>↓ Download Result</button>
+    </div>
+
+    <!-- Config -->
+    <div class="panel-section">
+      <div class="section-label">Configuration</div>
+      <div class="kv-row">
+        <span class="kv-key">Upscaler</span>
+        <span class="kv-val" id="cfg-upscaler">RealESRGAN ×4</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Target</span>
+        <span class="kv-val">3840 × 2160</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Audio Model</span>
+        <span class="kv-val">Spectral Ctxl</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Gap Thresh</span>
+        <span class="kv-val">−60 dB / 100 ms</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Batch Size</span>
+        <span class="kv-val" id="cfg-batch">4 frames</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Device</span>
+        <span class="kv-val" id="cfg-device">Auto</span>
+      </div>
+    </div>
+
+    <!-- Pipeline Stages -->
+    <div class="panel-section" style="flex:1;">
+      <div class="section-label">Pipeline Stages</div>
+      <div class="stage-list">
+        <div class="stage-item" id="stg-ingest">
+          <div class="stage-dot"></div>
+          <div class="stage-info">
+            <div class="stage-name">Input &amp; Probe</div>
+            <div class="stage-sub">FFprobe analysis</div>
+          </div>
+          <div class="stage-pct" id="stg-ingest-pct">—</div>
+        </div>
+        <div class="stage-item" id="stg-demux">
+          <div class="stage-dot"></div>
+          <div class="stage-info">
+            <div class="stage-name">Demux</div>
+            <div class="stage-sub">FFmpeg AV split</div>
+          </div>
+          <div class="stage-pct" id="stg-demux-pct">—</div>
+        </div>
+        <div class="stage-item" id="stg-audio">
+          <div class="stage-dot"></div>
+          <div class="stage-info">
+            <div class="stage-name">Audio Repair</div>
+            <div class="stage-sub">Inpaint + Denoise</div>
+          </div>
+          <div class="stage-pct" id="stg-audio-pct">—</div>
+        </div>
+        <div class="stage-item" id="stg-video">
+          <div class="stage-dot"></div>
+          <div class="stage-info">
+            <div class="stage-name">4K Upscale</div>
+            <div class="stage-sub">Real-ESRGAN ×4</div>
+          </div>
+          <div class="stage-pct" id="stg-video-pct">—</div>
+        </div>
+        <div class="stage-item" id="stg-remux">
+          <div class="stage-dot"></div>
+          <div class="stage-info">
+            <div class="stage-name">Remux</div>
+            <div class="stage-sub">H.264 / AAC-320k</div>
+          </div>
+          <div class="stage-pct" id="stg-remux-pct">—</div>
+        </div>
+        <div class="stage-item" id="stg-output">
+          <div class="stage-dot"></div>
+          <div class="stage-info">
+            <div class="stage-name">Output Ready</div>
+            <div class="stage-sub">MP4 packaged</div>
+          </div>
+          <div class="stage-pct" id="stg-output-pct">—</div>
+        </div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── 3D Canvas ───────────────────────────────────────────────────────────── -->
+  <main id="canvas-wrap">
+    <canvas id="three-canvas"></canvas>
+    <div id="node-labels"></div>
+  </main>
+
+  <!-- ── Right Panel ────────────────────────────────────────────────────────── -->
+  <aside id="panel-right">
+
+    <!-- Overall Progress -->
+    <div class="tel-group">
+      <div class="section-label">Overall</div>
+      <div class="tel-item">
+        <div class="tel-header">
+          <span class="tel-label">Pipeline Progress</span>
+          <span class="tel-value cyan" id="tel-overall">0%</span>
+        </div>
+        <div class="tel-bar">
+          <div class="tel-bar-fill" id="bar-overall" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Compute Meters -->
+    <div class="tel-group">
+      <div class="section-label">Compute</div>
+      <div class="tel-item">
+        <div class="tel-header">
+          <span class="tel-label">GPU Memory</span>
+          <span class="tel-value cyan" id="tel-gpu">0%</span>
+        </div>
+        <div class="tel-bar">
+          <div class="tel-bar-fill" id="bar-gpu" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="tel-item">
+        <div class="tel-header">
+          <span class="tel-label">GPU Temp</span>
+          <span class="tel-value amber" id="tel-temp">— °C</span>
+        </div>
+        <div class="tel-bar">
+          <div class="tel-bar-fill amber" id="bar-temp" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Branch Meters -->
+    <div class="tel-group">
+      <div class="section-label">Audio Branch</div>
+      <div class="tel-item">
+        <div class="tel-header">
+          <span class="tel-label">Repair Progress</span>
+          <span class="tel-value amber" id="tel-audio">0%</span>
+        </div>
+        <div class="tel-bar">
+          <div class="tel-bar-fill amber" id="bar-audio" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="tel-item">
+        <div class="tel-header">
+          <span class="tel-label">Gaps Filled</span>
+          <span class="tel-value amber" id="tel-gaps">—</span>
+        </div>
+        <div class="tel-bar">
+          <div class="tel-bar-fill amber" id="bar-gaps" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tel-group">
+      <div class="section-label">Video Branch</div>
+      <div class="tel-item">
+        <div class="tel-header">
+          <span class="tel-label">Upscale Progress</span>
+          <span class="tel-value violet" id="tel-video">0%</span>
+        </div>
+        <div class="tel-bar">
+          <div class="tel-bar-fill violet" id="bar-video" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Readout cells -->
+    <div class="readout-grid">
+      <div class="readout-cell">
+        <div class="readout-num" id="rout-frame">0</div>
+        <div class="readout-lbl">Frame</div>
+      </div>
+      <div class="readout-cell">
+        <div class="readout-num" id="rout-total">—</div>
+        <div class="readout-lbl">Total</div>
+      </div>
+      <div class="readout-cell">
+        <div class="readout-num" id="rout-fps">—</div>
+        <div class="readout-lbl">FPS</div>
+      </div>
+      <div class="readout-cell">
+        <div class="readout-num" id="rout-batch">—</div>
+        <div class="readout-lbl">Batch</div>
+      </div>
+    </div>
+
+    <!-- Session info -->
+    <div class="tel-group">
+      <div class="section-label">Session</div>
+      <div class="kv-row">
+        <span class="kv-key">Duration</span>
+        <span class="kv-val" id="kv-elapsed">00:00:00</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Output Size</span>
+        <span class="kv-val" id="kv-size">—</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Device</span>
+        <span class="kv-val" id="kv-device">—</span>
+      </div>
+      <div class="kv-row">
+        <span class="kv-key">Upscaler</span>
+        <span class="kv-val" id="kv-upscaler-used">—</span>
+      </div>
+    </div>
+
+    <!-- Event log -->
+    <div class="panel-section" style="padding-bottom:6px;">
+      <div class="section-label">Event Log</div>
+    </div>
+    <div id="log-box"></div>
+
+  </aside>
+
+  <!-- ── Footer ─────────────────────────────────────────────────────────────── -->
+  <footer id="footer">
+    <span class="footer-label">Progress</span>
+    <div id="overall-bar-wrap">
+      <div id="overall-bar-fill"></div>
+    </div>
+    <span id="overall-pct">0%</span>
+    <div style="width:1px;height:20px;background:var(--border);flex-shrink:0;"></div>
+    <span id="stage-text">IDLE</span>
+    <div style="flex:1;"></div>
+    <span class="elapsed" id="footer-elapsed">00:00:00</span>
+  </footer>
+
+</div><!-- /#app -->
+
+<!-- Entry point (module so importmap resolves three/) -->
+<script type="module" src="app.js"></script>
+
+</body>
+</html>

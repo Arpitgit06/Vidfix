@@ -1,0 +1,42 @@
+{
+  "system": {
+    "acceleration": "auto",
+    "threads": 8,
+    "output_directory": "./restored_output",
+    "log_level": "INFO",
+    "max_concurrent_jobs": 2,
+    "job_cleanup_hours": 24
+  },
+  "audio": {
+    "inpainting_model": "spectral_contextual",
+    "audioldm2_model": "cvssp/audioldm2",
+    "silence_threshold_db": -60.0,
+    "min_gap_duration_ms": 100.0,
+    "context_seconds": 3.0,
+    "n_fft": 2048,
+    "hop_length": 512,
+    "noise_reduction_aggressive_level": 0.5,
+    "target_sample_rate": 48000,
+    "normalize_peak_db": -1.0
+  },
+  "video": {
+    "target_resolution": "4K",
+    "target_width": 3840,
+    "target_height": 2160,
+    "upscale_model": "RealESRGAN_x4plus",
+    "upscale_model_path": "./weights/RealESRGAN_x4plus.pth",
+    "target_fps": 60,
+    "enable_frame_interpolation": false,
+    "batch_size": 4,
+    "tile_size": 256,
+    "tile_pad": 10,
+    "use_half_precision": true,
+    "encoder_preset": "slow",
+    "encoder_crf": 18
+  },
+  "gui": {
+    "ws_port": 8765,
+    "host": "0.0.0.0",
+    "telemetry_interval_ms": 100
+  }
+}
