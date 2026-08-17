@@ -40,7 +40,24 @@ if not exist weights\RealESRGAN_x4plus.pth (
     echo Model weights already present.
 )
 
-:: 3. Setup FFmpeg
+:: 3. Setup AI Audio Model Weights (Hugging Face)
+echo.
+echo [3.5/4] Downloading AI Audio Model Weights...
+if not exist weights\fish-speech-s2-pro-fp8 (
+    echo Downloading Fish Audio S2 Pro (FP8 variant)...
+    call .venv\Scripts\huggingface-cli download fishaudio/fish-speech-1.5-s2-pro-fp8 --local-dir weights\fish-speech-s2-pro-fp8
+) else (
+    echo Fish Audio S2 Pro (FP8 variant) already present.
+)
+
+if not exist weights\fireredtts (
+    echo Downloading FireRedTTS3...
+    call .venv\Scripts\huggingface-cli download FireRedTeam/FireRedTTS --local-dir weights\fireredtts
+) else (
+    echo FireRedTTS3 already present.
+)
+
+:: 4. Setup FFmpeg
 echo.
 echo [4/4] Checking for FFmpeg...
 where ffmpeg >nul 2>nul
