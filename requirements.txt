@@ -27,6 +27,12 @@ ffmpeg-python==0.2.0               # ffmpeg-python bindings (requires ffmpeg bin
 # ── Deep Learning (CPU fallback if CUDA not available) ────────────────────────
 torch>=2.1.0                       # PyTorch for bicubic GPU upscale + ESRGAN
 torchvision>=0.16.0
+torchaudio>=2.1.0                  # Required for Audio AI Models
+
+# ── AI Audio Models (Fish Audio & FireRedTTS) ─────────────────────────────────
+huggingface_hub>=0.23.0
+transformers>=4.40.0
+
 
 # ── Optional: Real-ESRGAN (4K AI upscaling) ───────────────────────────────────
 # Uncomment if you have GPU and want true AI upscaling (not just bicubic):
