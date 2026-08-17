@@ -49,8 +49,14 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from pipeline import ProcessingPipeline
+
+class ProcessConfig(BaseModel):
+    audio_mode: str = "gap_fill"
+    script_text: str = ""
+
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -223,7 +229,10 @@ async def health():
 
 
 @app.post("/api/upload", tags=["jobs"])
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(
+    file: UploadFile = File(...),
+    ref_audio: Optional[UploadFile] = File(None)
+):
     """
     Accept a video upload.
 
@@ -257,6 +266,19 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Write failed: {exc}") from exc
 
+    if ref_audio:
+        ref_ext = Path(ref_audio.filename or "").suffix.lower()
+        ref_dest = job_dir / f"ref_audio{ref_ext}"
+        try:
+            with open(ref_dest, "wb") as fh:
+                while True:
+                    chunk = await ref_audio.read(_UPLOAD_CHUNK_SZ)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+        except Exception as exc:
+            logger.warning("Failed to save ref_audio: %s", exc)
+
     size_mb = dest.stat().st_size / (1024 ** 2)
     logger.info("Uploaded: %s (%.1f MB) → job=%s", file.filename, size_mb, job_id)
 
@@ -275,7 +297,7 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 @app.post("/api/process/{job_id}", tags=["jobs"])
-async def start_processing(job_id: str, background_tasks: BackgroundTasks):
+async def start_processing(job_id: str, background_tasks: BackgroundTasks, config: ProcessConfig):
     """
     Launch the restoration pipeline for a previously uploaded job.
     Processing runs in a FastAPI background task so the response is immediate.
@@ -291,6 +313,7 @@ async def start_processing(job_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=409, detail="Job is already processing.")
 
     entry["status"] = "processing"
+    entry["config"] = config.dict()
     background_tasks.add_task(_pipeline_task, job_id)
 
     return {"job_id": job_id, "status": "processing_started"}

@@ -62,10 +62,12 @@ class ProcessingPipeline:
         job_id:             str,
         connection_manager: Any,
         config:             Optional[Dict] = None,
+        job_config:         Optional[Dict] = None,
     ) -> None:
         self.job_id  = job_id
         self.manager = connection_manager
         self.config  = config or self._load_config()
+        self.job_config = job_config or {}
 
         self.job_dir              = Path(f"./jobs/{job_id}")
         self.temp_dir             = self.job_dir / "temp"
@@ -136,11 +138,18 @@ class ProcessingPipeline:
             await self._tele({"stage": "demuxing", "overall_progress": 10})
 
             raw_audio_path: Optional[Path] = None
+            ref_audio_path: Optional[Path] = None
             if has_audio:
                 raw_audio_path = self.temp_dir / "raw_audio.wav"
                 await self._run_in_executor(
                     self._ffmpeg_extract_audio, input_path, raw_audio_path
                 )
+
+            # Check if reference audio was uploaded
+            for f in self.job_dir.iterdir():
+                if f.name.startswith("ref_audio"):
+                    ref_audio_path = f
+                    break
 
             if has_video:
                 await self._tele({"stage": "frame_extraction", "overall_progress": 14})
@@ -166,13 +175,15 @@ class ProcessingPipeline:
             tasks = []
 
             if has_audio and raw_audio_path is not None:
+                audio_config = {**(self.config.get("audio") or {}), "ai_config": self.job_config}
                 audio_engine = AudioEngine(
-                    config=self.config.get("audio"),
+                    config=audio_config,
                     telemetry_callback=self._make_branch_callback("audio"),
                 )
                 repaired_audio = self.temp_dir / "repaired_audio.wav"
                 tasks.append(("audio", audio_engine.process(
-                    str(raw_audio_path), str(repaired_audio)
+                    str(raw_audio_path), str(repaired_audio),
+                    ref_audio_path=str(ref_audio_path) if ref_audio_path else None
                 )))
 
             if has_video:

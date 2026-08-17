@@ -22,6 +22,10 @@ jobs/
 restored_output/
 weights/
 
+# Temporary setup artifacts
+ffmpeg.zip
+ffmpeg_temp/
+
 # OS/IDE files
 .DS_Store
 Thumbs.db

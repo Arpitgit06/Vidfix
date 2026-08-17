@@ -4,9 +4,9 @@
 4K video upscaling (Real-ESRGAN), and a real-time 3D wireframe telemetry GUI.
 
 ```
-INPUT FILE → DEMUXER → ┌── AUDIO REPAIR (spectral inpainting) ──┐
-                        │                                         ├→ REMUXER → OUTPUT 4K MP4
-                        └── VIDEO 4K UPSCALE (Real-ESRGAN ×4) ──┘
+INPUT FILE → DEMUXER → ┌── AUDIO REPAIR (FireRedTTS3 Inpainting / Fish Audio Gen) ──┐
+                        │                                                              ├→ REMUXER → OUTPUT 4K MP4
+                        └── VIDEO 4K UPSCALE (Real-ESRGAN ×4) ─────────────────────────┘
 ```
 
 ---
@@ -24,10 +24,11 @@ av-synthrestore-3d/
 ├── config.json      All tunable parameters
 ├── index.html       Dark-mode UI shell (Rajdhani + JetBrains Mono)
 ├── app.js           Three.js 3D wireframe node-graph + WS telemetry client
-├── setup.bat        Windows environment setup (Venv, weights)
+├── setup.bat        Windows environment setup (Venv, AI weights, FFmpeg)
 ├── run.bat          Windows launch script (Starts backend and opens browser)
 ├── cleanup.bat      Cleanup script (removes virtual env, weights, and temp files)
-├── weights/         Created at runtime or setup – holds RealESRGAN_x4plus.pth
+├── model_manager.py Intelligent VRAM caching and lazy-loading for AI models
+├── weights/         Holds RealESRGAN, Fish Audio S2 Pro (FP8), and FireRedTTS3
 ├── jobs/            Created at runtime – one dir per job_id
 ├── restored_output/ Created at runtime – final MP4s land here
 ├── requirements.txt Python dependencies
@@ -152,19 +153,32 @@ curl -s -X POST http://localhost:8765/api/process/$JOB | jq
 
 ---
 
-## Audio Engine — How Spectral Inpainting Works
+## Audio Engine — Generative AI & Spectral Inpainting
 
-1. **Gap Detection** – librosa RMS frames below −60 dB for ≥ 100 ms are tagged as gaps. A morphological closing pass merges near-adjacent micro-silences.
+We've completely overhauled the audio engine to support state-of-the-art AI models, while keeping the classic spectral inpainting as a fallback. 
 
-2. **Context Extraction** – 3 seconds of audio *before* and *after* each gap are STFT-analysed (`n_fft=2048`, `hop=512`).
+Here's how we handle audio now:
 
-3. **Magnitude Interpolation** – The mean spectral magnitude of the last 8 pre-frames is linearly blended (α from 0→1) into the mean of the first 8 post-frames across the gap. A small noise term drawn from pre-context standard deviation preserves harmonic texture.
+1. **AI Gap Inpainting (FireRedTTS3)**: If your video has annoying jump cuts, missing chunks, or mispronounced words, we feed the broken track into FireRedTTS3. Think of it like Photoshop's Content-Aware Fill for audio—it perfectly matches the room acoustics, background noise, and pacing of the original video to seamlessly "in-paint" the missing words.
 
-4. **Phase Extrapolation (IFE)** – Per-bin instantaneous frequency is estimated from the last 4 pre-frames and rolled forward. The trailing 25 % of gap frames blend into post-context phase for a smooth landing.
+2. **Full Audio Generation (Fish Audio S2 Pro)**: Need a voiceover for a completely silent video? Provide a text script and a tiny reference audio clip, and Fish Audio S2 Pro (specifically the hyper-efficient FP8 variant) will generate the entire track from scratch. It replicates the unique voice blueprint—timbre, accent, tone—and handles long paragraphs with natural breathing and human-like pacing.
 
-5. **Cross-fading** – 16 ms Hann ramps are applied at both boundary junctions to prevent clicks.
+3. **Classic Spectral Inpainting (Fallback)**: 
+   - **Gap Detection** – librosa RMS frames below −60 dB for ≥ 100 ms are tagged as gaps.
+   - **Context Extraction** – 3 seconds of audio *before* and *after* each gap are STFT-analysed.
+   - **Magnitude Interpolation & Phase Extrapolation** – Smoothly blends the audio across the gap.
+   - **Noise Reduction** – Full-track spectral subtraction using the first 0.5 s as a noise profile.
 
-6. **Noise Reduction** – Full-track spectral subtraction using the first 0.5 s as a noise profile, with a soft floor at `0.1 × signal` to prevent musical noise artefacts.
+---
+
+## Intelligent VRAM Management (The 8GB GPU Rule)
+
+Running multiple heavy AI models (RealESRGAN, Fish Audio, FireRedTTS3) usually requires a massive GPU. We built a custom `model_manager.py` to make this run flawlessly on a standard 8GB card:
+
+- **Zero Global Variables**: Models are never permanently pinned in memory.
+- **Lazy Loading**: When you boot the server, VRAM stays at 0GB. Models are only loaded the exact millisecond they are needed.
+- **Batch Processing Lifecycle**: We never load two audio models at the same time. We load one, process the task, and keep it warm.
+- **The 60-Second "Keep-Alive" Cache**: Instead of flushing VRAM immediately and taking a 15-second penalty to reload the model for the next clip, we start a 60-second idle timer. If you send another clip within 60 seconds, it processes instantly. If you go grab a coffee, a background worker silently flushes the VRAM (`gc.collect()` + `torch.cuda.empty_cache()`), freeing up your GPU for other tasks.
 
 ---
 

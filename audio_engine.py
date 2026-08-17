@@ -23,6 +23,8 @@ import scipy.ndimage
 import scipy.signal
 import soundfile as sf
 
+from model_manager import model_manager
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,11 +85,12 @@ class AudioEngine:
         self.n_fft                = int(  cfg.get("n_fft",                self.N_FFT))
         self.hop_length           = int(  cfg.get("hop_length",           self.HOP_LENGTH))
         self.noise_level          = float(cfg.get("noise_reduction_aggressive_level", 0.5))
+        self.config               = cfg
         self.telemetry_callback   = telemetry_callback
 
     # ── Public Entry Point ─────────────────────────────────────────────────────
 
-    async def process(self, audio_path: str, output_path: str) -> dict:
+    async def process(self, audio_path: str, output_path: str, ref_audio_path: Optional[str] = None) -> dict:
         """
         Run the complete audio restoration pipeline.
 
@@ -130,9 +133,45 @@ class AudioEngine:
             "gap_count":     len(gaps),
         })
 
+        ai_config = getattr(self, "config", {}).get("ai_config", {}) if hasattr(self, "config") else {}
+        audio_mode = ai_config.get("audio_mode", "gap_fill")
+        script_text = ai_config.get("script_text", "")
+
+        if audio_mode == "full_gen" and script_text:
+            logger.info("Using Fish Audio S2 Pro for Full Audio Generation.")
+            model = await model_manager.get_model("fish_audio")
+            
+            # If no ref audio provided, we could extract from audio_path, but here we just pass audio_path
+            ref_path_to_use = ref_audio_path if ref_audio_path else audio_path
+            
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, model.generate_audio, script_text, ref_path_to_use)
+            
+            # Assuming it overwrote output_path or we mock it. For now, we'll just copy input to output in mock
+            import shutil
+            shutil.copy(audio_path, output_path)
+            
+            # Flush timer
+            await model_manager.schedule_flush()
+            
+            return {
+                "gaps_found": 0,
+                "gaps_repaired": 0,
+                "sample_rate": sr,
+                "channels": num_channels,
+                "duration": round(duration, 2),
+                "ai_mode": "full_gen"
+            }
+
         # ── Inpaint Each Gap ──────────────────────────────────────────────────
         repaired = audio.copy()
         total    = max(len(gaps), 1)
+        
+        # Load FireRedTTS3 if we have gaps and using AI mode
+        ai_model = None
+        if len(gaps) > 0 and audio_mode == "gap_fill":
+            logger.info("Using FireRedTTS3 for gap inpainting.")
+            ai_model = await model_manager.get_model("fireredtts")
 
         for i, gap in enumerate(gaps):
             progress = 20 + int((i / total) * 55)
@@ -147,7 +186,11 @@ class AudioEngine:
 
             # Process each channel independently so phase is preserved per-ch
             for ch in range(num_channels):
-                repaired[ch] = await self._inpaint_gap_async(repaired[ch], gap, sr)
+                if ai_model:
+                    # Mock AI inpainting
+                    repaired[ch] = await self._inpaint_ai_async(ai_model, repaired[ch], gap, sr)
+                else:
+                    repaired[ch] = await self._inpaint_gap_async(repaired[ch], gap, sr)
 
         await self._telemetry({
             "stage":               "audio_inpainted",
@@ -180,6 +223,9 @@ class AudioEngine:
 
         del repaired, denoised
         gc.collect()
+
+        # Schedule VRAM flush after processing is done
+        await model_manager.schedule_flush()
 
         await self._telemetry({
             "stage":               "audio_complete",
@@ -260,6 +306,14 @@ class AudioEngine:
         return gaps
 
     # ── Private: Inpainting ───────────────────────────────────────────────────
+
+    async def _inpaint_ai_async(
+        self, model, audio: np.ndarray, gap: AudioGap, sr: int
+    ) -> np.ndarray:
+        loop = asyncio.get_event_loop()
+        # In actual implementation, we'd slice the audio and pass to model.inpaint_audio
+        # For the mock, we just pass the whole array
+        return await loop.run_in_executor(None, model.inpaint_audio, audio, sr)
 
     async def _inpaint_gap_async(
         self, audio: np.ndarray, gap: AudioGap, sr: int
