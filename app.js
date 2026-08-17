@@ -903,6 +903,11 @@ async function uploadFile() {
   const form = new FormData();
   form.append('file', S.uploadedFile);
 
+  const refInput = document.getElementById('ref-audio-input');
+  if (refInput && refInput.files[0]) {
+    form.append('ref_audio', refInput.files[0]);
+  }
+
   try {
     const res  = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: form });
     const data = await res.json();
@@ -938,7 +943,19 @@ async function startProcessing() {
   uiLog('Starting restoration pipeline…', 'info');
 
   try {
-    const res  = await fetch(`${API_BASE}/api/process/${S.jobId}`, { method: 'POST' });
+    const aiMode = document.getElementById('audio-mode-select')?.value || 'gap_fill';
+    const scriptText = document.getElementById('audio-script-input')?.value || '';
+    
+    const payload = {
+      audio_mode: aiMode,
+      script_text: scriptText
+    };
+
+    const res  = await fetch(`${API_BASE}/api/process/${S.jobId}`, { 
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.statusText);
     uiLog(`Pipeline started: ${data.status}`, 'ok');
@@ -1006,6 +1023,19 @@ function _setupFileHandlers() {
   document.getElementById('btn-upload').addEventListener('click', uploadFile);
   document.getElementById('btn-process').addEventListener('click', startProcessing);
   document.getElementById('btn-download').addEventListener('click', downloadResult);
+
+  // Ref audio wiring
+  const refInput = document.getElementById('ref-audio-input');
+  if (refInput) {
+    refInput.addEventListener('change', (e) => {
+      const nameEl = document.getElementById('ref-audio-name');
+      if (e.target.files[0]) {
+        nameEl.textContent = e.target.files[0].name;
+      } else {
+        nameEl.textContent = '';
+      }
+    });
+  }
 }
 
 function _handleFileSelect(file) {

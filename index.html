@@ -728,6 +728,28 @@
       <input type="file" id="file-input" accept=".mp4,.mkv,.avi,.mov,.webm,.m4v" />
     </div>
 
+    <!-- AI Audio Overrides -->
+    <div class="panel-section">
+      <div class="section-label">AI Audio Gen</div>
+      <div class="kv-row" style="flex-direction: column; align-items: stretch; gap: 4px;">
+        <span class="kv-key">Mode</span>
+        <select id="audio-mode-select">
+          <option value="gap_fill">Gap Fill (FireRedTTS3)</option>
+          <option value="full_gen">Full Generation (Fish Audio)</option>
+        </select>
+      </div>
+      <div class="kv-row" style="flex-direction: column; align-items: stretch; gap: 4px; margin-top: 8px;">
+        <span class="kv-key">Reference Audio (Optional)</span>
+        <button class="btn" style="padding: 4px 8px; font-size: 10px; margin-top: 0; border-color: var(--border-hi);" onclick="document.getElementById('ref-audio-input').click()">📁 Select Ref</button>
+        <div id="ref-audio-name" style="font-family: var(--font-mono); font-size: 9px; color: var(--c-green); margin-top: 2px;"></div>
+        <input type="file" id="ref-audio-input" accept="audio/*" style="display: none;" />
+      </div>
+      <div class="kv-row" style="flex-direction: column; align-items: stretch; gap: 4px; margin-top: 8px;">
+        <span class="kv-key">Text Script</span>
+        <textarea id="audio-script-input" rows="3" placeholder="Enter script here..." style="background: var(--bg-surface); border: 1px solid var(--border-hi); color: var(--c-text); font-family: var(--font-ui); font-size: 11px; padding: 4px; resize: vertical; outline: none;"></textarea>
+      </div>
+    </div>
+
     <!-- Actions -->
     <div class="panel-section">
       <div class="section-label">Actions</div>
