@@ -6,11 +6,15 @@ echo.
 
 :: 1. Setup Python Virtual Environment
 echo [1/4] Setting up Python Virtual Environment (.venv)...
-python -m venv .venv
-if %ERRORLEVEL% neq 0 (
-    echo Error: Python is not installed or not in PATH.
-    pause
-    exit /b %ERRORLEVEL%
+if not exist .venv\Scripts\python.exe (
+    python -m venv .venv
+    if %ERRORLEVEL% neq 0 (
+        echo Error: Python is not installed or not in PATH.
+        pause
+        exit /b %ERRORLEVEL%
+    )
+) else (
+    echo Virtual Environment already exists.
 )
 
 echo.
@@ -44,10 +48,10 @@ if not exist weights\RealESRGAN_x4plus.pth (
 echo.
 echo [3.5/4] Downloading AI Audio Model Weights...
 if not exist weights\fish-speech-s2-pro-fp8 (
-    echo Downloading Fish Audio S2 Pro (FP8 variant)...
+    echo Downloading Fish Audio S2 Pro [FP8 variant]...
     call .venv\Scripts\huggingface-cli download fishaudio/fish-speech-1.5-s2-pro-fp8 --local-dir weights\fish-speech-s2-pro-fp8
 ) else (
-    echo Fish Audio S2 Pro (FP8 variant) already present.
+    echo Fish Audio S2 Pro [FP8 variant] already present.
 )
 
 if not exist weights\fireredtts (
