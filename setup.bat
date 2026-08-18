@@ -49,14 +49,14 @@ echo.
 echo [3.5/4] Downloading AI Audio Model Weights...
 if not exist weights\fish-speech-s2-pro-fp8 (
     echo Downloading Fish Audio S2 Pro [FP8 variant]...
-    call .venv\Scripts\huggingface-cli download fishaudio/fish-speech-1.5-s2-pro-fp8 --local-dir weights\fish-speech-s2-pro-fp8
+    call .venv\Scripts\hf download AEmotionStudio/fish-speech-s2-pro-fp8 --local-dir weights\fish-speech-s2-pro-fp8
 ) else (
     echo Fish Audio S2 Pro [FP8 variant] already present.
 )
 
 if not exist weights\fireredtts (
     echo Downloading FireRedTTS3...
-    call .venv\Scripts\huggingface-cli download FireRedTeam/FireRedTTS --local-dir weights\fireredtts
+    call .venv\Scripts\hf download FireRedTeam/FireRedTTS --local-dir weights\fireredtts
 ) else (
     echo FireRedTTS3 already present.
 )
