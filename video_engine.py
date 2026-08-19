@@ -1,7 +1,8 @@
 """
 video_engine.py – AV-SynthRestore 3D
 4K video upscaling using Real-ESRGAN (or PyTorch bicubic fallback) with
-VRAM-safe batch tensor processing and per-frame CUDA memory cleanup.
+optimized GPU pipeline: producer-consumer I/O, dynamic tile calibration,
+torch.compile acceleration, and parallel PNG writes.
 """
 
 from __future__ import annotations
@@ -10,6 +11,9 @@ import asyncio
 import gc
 import logging
 import os
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -52,15 +56,18 @@ class VideoEngine:
     """
     Orchestrates per-frame AI upscaling to 4K.
 
-    Processing stages
-    -----------------
-    1. Enumerate extracted frame PNGs from `frames_dir`.
-    2. Initialise Real-ESRGAN model (lazy, first use only).
-    3. Process frames in configurable batches.
-       – Each batch is run off the event loop so WebSocket keepalives continue.
-       – After every batch: `torch.cuda.empty_cache()` + `gc.collect()`.
-    4. Per-frame fallback to PyTorch bicubic / OpenCV Lanczos on ESRGAN error.
-    5. Write upscaled frames to `output_frames_dir` as lossless PNG.
+    Processing Pipeline (Optimized)
+    --------------------------------
+    1. Auto-calibrate tile size: try tile=0 (no tiling) first for maximum
+       throughput, fall back to configured tile size on OOM.
+    2. Apply torch.compile to the neural network for kernel fusion.
+    3. Producer-Consumer I/O pipeline:
+       - Reader thread:  pre-loads frames from disk into a RAM queue.
+       - GPU thread:     pulls from read queue, runs AI upscaling, pushes
+                         results to write pool.
+       - Writer pool:    multiple threads compress and write PNGs in parallel.
+    4. Per-frame OOM fallback to PyTorch bicubic / OpenCV Lanczos.
+    5. Async telemetry updates every 2 seconds while pipeline runs.
     """
 
     TARGET_W: int = 3840
@@ -72,10 +79,12 @@ class VideoEngine:
         telemetry_callback: Optional[Callable] = None,
     ) -> None:
         cfg = config or {}
-        self.batch_size   = int(cfg.get("batch_size",  4))
-        self.tile_size    = int(cfg.get("tile_size",   256))
-        self.tile_pad     = int(cfg.get("tile_pad",    10))
-        self.use_half     = bool(cfg.get("use_half_precision", True))
+        self.batch_size    = int(cfg.get("batch_size",  4))
+        self.tile_size     = int(cfg.get("tile_size",   800))
+        self.tile_pad      = int(cfg.get("tile_pad",    10))
+        self.use_half      = bool(cfg.get("use_half_precision", True))
+        self.io_prefetch   = int(cfg.get("io_prefetch", 12))
+        self.write_workers = int(cfg.get("write_workers", 4))
         model_path_str = cfg.get("upscale_model_path", "./weights/RealESRGAN_x4plus.pth")
         if model_path_str.startswith("./"):
             self.model_path = str(Path(__file__).parent / model_path_str[2:])
@@ -85,8 +94,14 @@ class VideoEngine:
         self.target_h     = int(cfg.get("target_height", self.TARGET_H))
         self.telemetry_callback = telemetry_callback
 
-        self._device:   str          = self._select_device()
-        self._upscaler: Optional[object] = None   # lazily initialised
+        self._device:       str            = self._select_device()
+        self._upscaler:     Optional[object] = None   # lazily initialised
+        self._optimal_tile: Optional[int]    = None   # set during calibration
+
+        # Thread-safe progress tracking for async telemetry
+        self._progress_processed: int = 0
+        self._progress_failed:    int = 0
+        self._progress_lock = threading.Lock()
 
     # ── Device Selection ───────────────────────────────────────────────────────
 
@@ -129,6 +144,26 @@ class VideoEngine:
                 half=(self.use_half and self._device == "cuda"),
                 device=self._device,
             )
+
+            # ── Optimization: cuDNN benchmark mode ────────────────────────
+            # Enables cuDNN auto-tuner to find the fastest convolution
+            # algorithms for the current GPU and input dimensions.
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.benchmark = True
+                logger.info("cuDNN benchmark mode enabled.")
+
+            # ── Optimization: torch.compile ───────────────────────────────
+            # Fuses GPU kernels and optimises memory layout.
+            # Typically yields 15-30% speedup on RTX 40-series GPUs.
+            if hasattr(torch, "compile") and self._device == "cuda":
+                try:
+                    self._upscaler.model = torch.compile(
+                        self._upscaler.model, mode="default"
+                    )
+                    logger.info("torch.compile applied to Real-ESRGAN model.")
+                except Exception as exc:
+                    logger.warning("torch.compile unavailable (non-fatal): %s", exc)
+
         else:
             reason = (
                 "Real-ESRGAN weights not found"
@@ -137,6 +172,42 @@ class VideoEngine:
             )
             logger.info("%s – using PyTorch bicubic / OpenCV Lanczos.", reason)
             self._upscaler = None
+
+    # ── Dynamic Tile Calibration ──────────────────────────────────────────────
+
+    def _calibrate_tile_size(self, sample_bgr: np.ndarray) -> None:
+        """
+        Auto-detect optimal tile size by testing the GPU with a real frame.
+
+        Strategy: try tile=0 (process entire frame at once) first. If the
+        GPU has enough VRAM, this eliminates all tiling overhead and is the
+        fastest possible mode. On OOM, fall back to the configured tile size.
+        """
+        if self._upscaler is None:
+            self._optimal_tile = self.tile_size
+            return
+
+        saved_tile = self._upscaler.tile
+
+        # Attempt: No tiling (maximum speed)
+        try:
+            self._upscaler.tile = 0
+            logger.info("Calibrating: testing tile=0 (no tiling)...")
+            self._upscaler.enhance(sample_bgr, outscale=4)
+            self._optimal_tile = 0
+            logger.info(
+                "Calibration result: tile=0 (NO TILING) – maximum GPU throughput!"
+            )
+            self._free_vram()
+            return
+        except (CUDA_OOM_EXCEPTION, RuntimeError) as exc:
+            logger.info("Calibration: tile=0 caused OOM (%s)", type(exc).__name__)
+            self._free_vram()
+
+        # Fall back to configured tile size
+        self._upscaler.tile = saved_tile
+        self._optimal_tile = saved_tile
+        logger.info("Calibration result: tile=%d", saved_tile)
 
     # ── Public Entry Point ─────────────────────────────────────────────────────
 
@@ -179,7 +250,22 @@ class VideoEngine:
             total, fps, self._device,
         )
 
+        # ── Initialise & Calibrate ────────────────────────────────────────
         self._init_upscaler()
+
+        if self._upscaler is not None and frame_paths:
+            sample = cv2.imread(str(frame_paths[0]), cv2.IMREAD_COLOR)
+            if sample is not None:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, self._calibrate_tile_size, sample
+                )
+
+        tile_desc = (
+            "DISABLED (full-frame)"
+            if self._optimal_tile == 0
+            else f"tile={self._optimal_tile}"
+        )
 
         await self._telemetry({
             "stage":        "video_upscaling",
@@ -187,59 +273,44 @@ class VideoEngine:
             "total_frames": total,
             "device":       self._device,
             "upscaler":     "RealESRGAN" if self._upscaler else "bicubic",
+            "tiling":       tile_desc,
         })
 
-        # ── Batch Loop ────────────────────────────────────────────────────
-        batches    = self._make_batches(frame_paths, self.batch_size)
-        processed  = 0
-        failed     = 0
+        # ── Reset progress counters ───────────────────────────────────────
+        with self._progress_lock:
+            self._progress_processed = 0
+            self._progress_failed    = 0
 
-        for batch_idx, batch in enumerate(batches):
-            try:
-                await self._process_batch(batch, output_frames_dir)
-                processed += len(batch)
-            except CUDA_OOM_EXCEPTION as oom:
-                logger.warning(
-                    "VRAM OOM on batch %d – falling back to frame-by-frame bicubic: %s",
-                    batch_idx, oom,
-                )
-                self._free_vram()
-                for fp in batch:
-                    try:
-                        self._bicubic_single(fp, output_frames_dir)
-                        processed += 1
-                    except Exception as fe:
-                        logger.error("Frame %s failed even on fallback: %s", fp.name, fe)
-                        # Copy source frame as-is so the remux doesn't break
-                        self._copy_frame_as_is(fp, output_frames_dir)
-                        failed += 1
-            except Exception as exc:
-                logger.error("Batch %d error: %s", batch_idx, exc)
-                for fp in batch:
-                    try:
-                        self._bicubic_single(fp, output_frames_dir)
-                        processed += 1
-                    except Exception:
-                        self._copy_frame_as_is(fp, output_frames_dir)
-                        failed += 1
-            finally:
-                self._free_vram()
+        # ── Launch producer-consumer pipeline in background executor ──────
+        loop = asyncio.get_event_loop()
+        pipeline_future = loop.run_in_executor(
+            None, self._run_pipeline, frame_paths, output_frames_dir
+        )
 
-            progress   = 5 + int((processed / total) * 90)
-            gpu_util   = self._gpu_memory_percent()
-            gpu_temp   = self._gpu_temp()
+        # ── Async telemetry polling while pipeline runs ───────────────────
+        while True:
+            done_set, _ = await asyncio.wait({pipeline_future}, timeout=2.0)
 
+            with self._progress_lock:
+                p = self._progress_processed
+                f = self._progress_failed
+
+            progress = 5 + int((p / max(total, 1)) * 90)
             await self._telemetry({
                 "stage":         "video_upscaling",
                 "video_progress": progress,
-                "frame":         processed,
+                "frame":         p,
                 "total_frames":  total,
-                "gpu_util":      gpu_util,
-                "gpu_temp":      gpu_temp,
-                "batch":         batch_idx + 1,
-                "total_batches": len(batches),
+                "gpu_util":      self._gpu_memory_percent(),
+                "gpu_temp":      self._gpu_temp(),
                 "fps":           round(fps, 2),
             })
+
+            if done_set:
+                break
+
+        # ── Collect result (raises on pipeline error) ─────────────────────
+        processed, failed = pipeline_future.result()
 
         await self._telemetry({
             "stage":         "video_complete",
@@ -255,45 +326,176 @@ class VideoEngine:
             "device":           self._device,
         }
 
-    # ── Batch Helpers ──────────────────────────────────────────────────────────
+    # ── Producer-Consumer Pipeline ─────────────────────────────────────────────
 
-    @staticmethod
-    def _make_batches(
-        paths: List[Path], batch_size: int
-    ) -> List[List[Path]]:
-        return [paths[i: i + batch_size] for i in range(0, len(paths), batch_size)]
+    def _run_pipeline(
+        self,
+        frame_paths: List[Path],
+        out_dir:     str,
+    ) -> Tuple[int, int]:
+        """
+        High-throughput frame processing pipeline.
 
-    async def _process_batch(
-        self, batch: List[Path], out_dir: str
-    ) -> None:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._sync_process_batch, batch, out_dir)
+        Architecture
+        ------------
+        ┌──────────┐     ┌──────────────┐     ┌──────────────┐
+        │  Reader  │ ──► │  GPU Worker   │ ──► │  Writer Pool │
+        │ (thread) │     │ (main thread) │     │ (4 threads)  │
+        └──────────┘     └──────────────┘     └──────────────┘
+             ↓                                       ↓
+          read_q                               ThreadPoolExecutor
+        (prefetch 12)                          (parallel PNG write)
 
-    def _sync_process_batch(self, batch: List[Path], out_dir: str) -> None:
-        for frame_path in batch:
-            out_path = Path(out_dir) / frame_path.name
-            bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-            if bgr is None:
-                raise IOError(f"cv2.imread returned None for: {frame_path}")
+        The reader constantly loads frames into RAM so the GPU never
+        waits for disk I/O.  The writer pool compresses and flushes
+        upscaled PNGs across multiple CPU cores in parallel.
 
-            if self._upscaler is not None:
-                upscaled, _ = self._upscaler.enhance(bgr, outscale=4)
-            elif TORCH_AVAILABLE:
-                upscaled = self._torch_bicubic(bgr)
-            else:
-                upscaled = self._cv2_lanczos(bgr)
+        Returns
+        -------
+        (processed, failed) tuple.
+        """
+        read_q:      queue.Queue = queue.Queue(maxsize=self.io_prefetch)
+        read_done:   threading.Event = threading.Event()
+        read_errors: List[Path] = []
 
-            # Hard-cap output to target 4K dimensions
-            h, w = upscaled.shape[:2]
-            if w > self.target_w or h > self.target_h:
-                upscaled = cv2.resize(
-                    upscaled,
-                    (self.target_w, self.target_h),
-                    interpolation=cv2.INTER_LANCZOS4,
-                )
+        write_pool = ThreadPoolExecutor(
+            max_workers=self.write_workers,
+            thread_name_prefix="frame-writer",
+        )
+        write_futures: list = []
 
-            # Lossless PNG with fast compression (level 1)
-            cv2.imwrite(str(out_path), upscaled, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        # ── Reader thread ─────────────────────────────────────────────────
+        def _reader() -> None:
+            try:
+                for fp in frame_paths:
+                    bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+                    if bgr is None:
+                        logger.error("cv2.imread returned None: %s", fp)
+                        read_errors.append(fp)
+                        continue
+                    read_q.put((fp, bgr))
+            except Exception as exc:
+                logger.error("Reader thread error: %s", exc)
+            finally:
+                read_done.set()
+
+        reader_t = threading.Thread(
+            target=_reader, daemon=True, name="frame-reader"
+        )
+        reader_t.start()
+
+        # ── GPU processing loop ───────────────────────────────────────────
+        processed = 0
+        failed    = 0
+
+        try:
+            while True:
+                # Pull next frame from pre-loaded queue
+                try:
+                    fp, bgr = read_q.get(timeout=3.0)
+                except queue.Empty:
+                    if read_done.is_set() and read_q.empty():
+                        break
+                    continue
+
+                # Upscale with AI model
+                try:
+                    upscaled = self._upscale_frame(bgr)
+
+                    # Hard-cap output to target 4K dimensions
+                    h, w = upscaled.shape[:2]
+                    if w > self.target_w or h > self.target_h:
+                        upscaled = cv2.resize(
+                            upscaled,
+                            (self.target_w, self.target_h),
+                            interpolation=cv2.INTER_LANCZOS4,
+                        )
+
+                    # Submit write to thread pool (non-blocking)
+                    out_path = str(Path(out_dir) / fp.name)
+                    fut = write_pool.submit(
+                        cv2.imwrite, out_path, upscaled,
+                        [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                    )
+                    write_futures.append(fut)
+                    processed += 1
+
+                except CUDA_OOM_EXCEPTION:
+                    logger.warning(
+                        "VRAM OOM on frame %s – bicubic fallback", fp.name
+                    )
+                    self._free_vram()
+                    try:
+                        upscaled = self._fallback_upscale(bgr)
+                        out_path = str(Path(out_dir) / fp.name)
+                        fut = write_pool.submit(
+                            cv2.imwrite, out_path, upscaled,
+                            [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                        )
+                        write_futures.append(fut)
+                        processed += 1
+                    except Exception:
+                        self._copy_frame_as_is(fp, out_dir)
+                        failed += 1
+
+                except Exception as exc:
+                    logger.error("Frame %s error: %s", fp.name, exc)
+                    try:
+                        upscaled = self._fallback_upscale(bgr)
+                        out_path = str(Path(out_dir) / fp.name)
+                        fut = write_pool.submit(
+                            cv2.imwrite, out_path, upscaled,
+                            [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                        )
+                        write_futures.append(fut)
+                        processed += 1
+                    except Exception:
+                        self._copy_frame_as_is(fp, out_dir)
+                        failed += 1
+
+                # Update thread-safe progress counters
+                with self._progress_lock:
+                    self._progress_processed = processed
+                    self._progress_failed    = failed
+
+                # Prune completed write futures to prevent unbounded list growth
+                if len(write_futures) > 50:
+                    write_futures = [f for f in write_futures if not f.done()]
+
+            # Count frames that failed to load from disk
+            failed += len(read_errors)
+            for fp in read_errors:
+                self._copy_frame_as_is(fp, out_dir)
+
+        finally:
+            # Drain all pending writes
+            write_pool.shutdown(wait=True)
+            reader_t.join(timeout=10)
+
+            # Final progress update
+            with self._progress_lock:
+                self._progress_processed = processed
+                self._progress_failed    = failed
+
+        return processed, failed
+
+    # ── Frame Upscaling ────────────────────────────────────────────────────────
+
+    def _upscale_frame(self, bgr: np.ndarray) -> np.ndarray:
+        """Run the primary upscaler (Real-ESRGAN or fallback) on a single frame."""
+        if self._upscaler is not None:
+            result, _ = self._upscaler.enhance(bgr, outscale=4)
+            return result
+        elif TORCH_AVAILABLE:
+            return self._torch_bicubic(bgr)
+        else:
+            return self._cv2_lanczos(bgr)
+
+    def _fallback_upscale(self, bgr: np.ndarray) -> np.ndarray:
+        """Bicubic / Lanczos fallback when ESRGAN fails on a frame."""
+        if TORCH_AVAILABLE:
+            return self._torch_bicubic(bgr)
+        return self._cv2_lanczos(bgr)
 
     # ── Per-Frame Upscaling Implementations ───────────────────────────────────
 
@@ -332,18 +534,6 @@ class VideoEngine:
         target_h = min(h * 4, self.target_h)
         return cv2.resize(bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-    def _bicubic_single(self, frame_path: Path, out_dir: str) -> None:
-        """Emergency per-frame bicubic upscale (fallback from batch OOM)."""
-        bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise IOError(str(frame_path))
-        out_path = Path(out_dir) / frame_path.name
-        if TORCH_AVAILABLE:
-            upscaled = self._torch_bicubic(bgr)
-        else:
-            upscaled = self._cv2_lanczos(bgr)
-        cv2.imwrite(str(out_path), upscaled, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-
     def _copy_frame_as_is(self, frame_path: Path, out_dir: str) -> None:
         """Last-resort fallback: copy source frame resized to target dimensions so remux can proceed."""
         bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
@@ -360,7 +550,7 @@ class VideoEngine:
     # ── VRAM / Memory Management ───────────────────────────────────────────────
 
     def _free_vram(self) -> None:
-        """Release GPU memory after each batch."""
+        """Release GPU memory (used for OOM recovery and calibration cleanup)."""
         if TORCH_AVAILABLE and self._device == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
