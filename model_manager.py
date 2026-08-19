@@ -30,7 +30,14 @@ class ModelManager:
         self._firered_tts = None
         self._active_model_name = None
         self._idle_timer_task = None
-        self._lock = asyncio.Lock()
+        # Lazy lock — created on first use inside the running event loop
+        self._lock = None
+
+    def _get_lock(self):
+        """Create the asyncio.Lock lazily so it's bound to the correct event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def get_model(self, model_name: str):
         """
@@ -38,14 +45,14 @@ class ModelManager:
         Flushes any currently loaded DIFFERENT model to ensure VRAM limits (8GB).
         Cancels any pending idle flush timer.
         """
-        async with self._lock:
+        async with self._get_lock():
             if self._idle_timer_task is not None:
                 self._idle_timer_task.cancel()
                 self._idle_timer_task = None
-                logger.info(f"Cancelled idle flush timer because {model_name} was requested.")
+                logger.info("Cancelled idle flush timer because %s was requested.", model_name)
 
             if self._active_model_name and self._active_model_name != model_name:
-                logger.info(f"Different model ({self._active_model_name}) is currently loaded. Flushing VRAM first...")
+                logger.info("Different model (%s) is currently loaded. Flushing VRAM first...", self._active_model_name)
                 self._flush_vram_sync()
 
             if model_name == "fish_audio":
@@ -53,7 +60,7 @@ class ModelManager:
                     logger.info("Loading Fish Audio S2 Pro (FP8) into VRAM...")
                     start_time = time.time()
                     self._fish_audio = self._load_fish_audio()
-                    logger.info(f"Fish Audio loaded in {time.time() - start_time:.2f}s")
+                    logger.info("Fish Audio loaded in %.2fs", time.time() - start_time)
                 self._active_model_name = "fish_audio"
                 return self._fish_audio
 
@@ -62,7 +69,7 @@ class ModelManager:
                     logger.info("Loading FireRedTTS3 into VRAM...")
                     start_time = time.time()
                     self._firered_tts = self._load_fireredtts()
-                    logger.info(f"FireRedTTS3 loaded in {time.time() - start_time:.2f}s")
+                    logger.info("FireRedTTS3 loaded in %.2fs", time.time() - start_time)
                 self._active_model_name = "fireredtts"
                 return self._firered_tts
             
@@ -73,7 +80,7 @@ class ModelManager:
         """
         Starts a 60-second countdown. If no new requests arrive, VRAM is flushed.
         """
-        async with self._lock:
+        async with self._get_lock():
             if self._idle_timer_task is not None:
                 self._idle_timer_task.cancel()
             
@@ -81,13 +88,19 @@ class ModelManager:
             self._idle_timer_task = asyncio.create_task(self._delayed_flush())
 
     async def _delayed_flush(self):
+        """Wait 60s then flush. Acquires lock separately to avoid deadlock."""
         try:
             await asyncio.sleep(60)
-            async with self._lock:
-                logger.info("60 seconds idle timeout reached. Flushing VRAM...")
-                self._flush_vram_sync()
+            await self._execute_flush()
         except asyncio.CancelledError:
-            pass # Timer was cancelled by a new request
+            pass  # Timer was cancelled by a new request
+
+    async def _execute_flush(self):
+        """Acquire lock and flush VRAM — called by the delayed timer."""
+        async with self._get_lock():
+            logger.info("60 seconds idle timeout reached. Flushing VRAM...")
+            self._flush_vram_sync()
+            self._idle_timer_task = None
 
     def _flush_vram_sync(self):
         """
@@ -120,22 +133,31 @@ class ModelManager:
         # that handles the interface. In production, this would be:
         # from transformers import ...
         class FishAudioMock:
-            def generate_audio(self, script_text: str, reference_audio_path: str = None):
-                logger.info(f"FishAudio generating for script: {script_text}")
+            def generate_audio(self, script_text: str, reference_audio_path: str = None, output_path: str = None):
+                logger.info("FishAudio generating for script: %s", script_text[:80])
                 # Simulate generation time
                 time.sleep(2)
-                # In real scenario, return generated numpy array or save to file
+                # In real scenario, generate audio and write to output_path
+                # For mock, write a silent WAV if output_path is provided
+                if output_path:
+                    import numpy as np
+                    import soundfile as sf
+                    # Generate 5 seconds of silence as placeholder
+                    sr = 48000
+                    silence = np.zeros(sr * 5, dtype=np.float32)
+                    sf.write(output_path, silence, sr, subtype="PCM_24")
                 return True 
         return FishAudioMock()
 
     def _load_fireredtts(self):
         # TODO: Initialize FireRedTTS3 from weights\\fireredtts
         class FireRedTTSMock:
-            def inpaint_audio(self, broken_audio, sample_rate):
-                logger.info("FireRedTTS3 inpainting audio gap...")
+            def inpaint_audio(self, context_audio, sample_rate, gap_start, gap_end):
+                logger.info("FireRedTTS3 inpainting audio gap (samples %d-%d)...", gap_start, gap_end)
                 time.sleep(1)
-                # In real scenario, return patched numpy array
-                return broken_audio 
+                # In real scenario, return patched numpy array with the gap filled
+                # For mock, just return the input unchanged
+                return context_audio 
         return FireRedTTSMock()
 
 # Global singleton instance

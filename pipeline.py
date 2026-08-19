@@ -198,15 +198,14 @@ class ProcessingPipeline:
                     total_frames,
                 )))
 
-            # Run both branches truly in parallel
-            coros      = [t[1] for t in tasks]
-            labels     = [t[0] for t in tasks]
-            results    = await asyncio.gather(*coros, return_exceptions=True)
-
-            for label, result in zip(labels, results):
-                if isinstance(result, Exception):
-                    logger.error("%s branch failed: %s", label, result)
-                    raise result
+            # Run branches sequentially to avoid OOM on 8GB GPUs.
+            # Audio runs first so VRAM can be flushed before video upscaling.
+            for label, coro in tasks:
+                try:
+                    result = await coro
+                except Exception as exc:
+                    logger.error("%s branch failed: %s", label, exc)
+                    raise
                 if label == "audio":
                     audio_result = result
                 else:

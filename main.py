@@ -452,7 +452,8 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
 async def _pipeline_task(job_id: str) -> None:
     """Runs the full processing pipeline and updates job registry on completion."""
     try:
-        pipeline = ProcessingPipeline(job_id, manager)
+        entry = _job_registry.get(job_id, {})
+        pipeline = ProcessingPipeline(job_id, manager, job_config=entry.get("config"))
         await pipeline.run()
         _job_registry.setdefault(job_id, {})["status"] = "complete"
     except Exception as exc:
