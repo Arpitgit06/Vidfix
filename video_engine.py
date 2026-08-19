@@ -187,11 +187,11 @@ class VideoEngine:
             self._optimal_tile = self.tile_size
             return
 
-        saved_tile = self._upscaler.tile
+        saved_tile = self._upscaler.tile_size
 
         # Attempt: No tiling (maximum speed)
         try:
-            self._upscaler.tile = 0
+            self._upscaler.tile_size = 0
             logger.info("Calibrating: testing tile=0 (no tiling)...")
             self._upscaler.enhance(sample_bgr, outscale=4)
             self._optimal_tile = 0
@@ -205,7 +205,7 @@ class VideoEngine:
             self._free_vram()
 
         # Fall back to configured tile size
-        self._upscaler.tile = saved_tile
+        self._upscaler.tile_size = saved_tile
         self._optimal_tile = saved_tile
         logger.info("Calibration result: tile=%d", saved_tile)
 
