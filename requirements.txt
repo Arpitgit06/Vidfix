@@ -24,10 +24,11 @@ numpy>=1.24.0,<2.0.0
 opencv-python-headless==4.9.0.80  # Use -headless to avoid GUI deps in server env
 ffmpeg-python==0.2.0               # ffmpeg-python bindings (requires ffmpeg binary on PATH)
 
-# ── Deep Learning (CPU fallback if CUDA not available) ────────────────────────
-torch>=2.1.0                       # PyTorch for bicubic GPU upscale + ESRGAN
-torchvision>=0.16.0
-torchaudio>=2.1.0                  # Required for Audio AI Models
+# ── Deep Learning ───────────────────────────────────────────────────────────────
+# (Installed explicitly via setup.bat with CUDA 12.1 index)
+# torch>=2.1.0                       
+# torchvision>=0.16.0
+# torchaudio>=2.1.0                  
 
 # ── AI Audio Models (Fish Audio & FireRedTTS) ─────────────────────────────────
 huggingface_hub>=0.23.0

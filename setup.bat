@@ -17,8 +17,18 @@ if not exist .venv\Scripts\python.exe (
     echo Virtual Environment already exists.
 )
 
+:: 2. Setup PyTorch and Dependencies
 echo.
-echo [2/4] Installing Python dependencies...
+echo [2/5] Installing PyTorch with CUDA 12.1...
+call .venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+if %ERRORLEVEL% neq 0 (
+    echo Error: Failed to install PyTorch.
+    pause
+    exit /b %ERRORLEVEL%
+)
+
+echo.
+echo [3/5] Installing Python dependencies...
 call .venv\Scripts\pip install -r requirements.txt
 if %ERRORLEVEL% neq 0 (
     echo Error: Failed to install Python packages.
@@ -94,6 +104,30 @@ powershell -Command "Remove-Item -Path 'ffmpeg.zip', 'ffmpeg_temp' -Recurse -For
 echo FFmpeg successfully set up in project root!
 
 :ffmpeg_done
+
+:: 5. Setup AI Audio Codebases
+echo.
+echo [5/5] Cloning and setting up AI Model repositories...
+
+if not exist libs (
+    mkdir libs
+)
+
+if not exist libs\FireRedTTS2 (
+    echo Cloning FireRedTTS2...
+    git clone https://github.com/FireRedTeam/FireRedTTS2.git libs\FireRedTTS2
+    call .venv\Scripts\pip install -e libs\FireRedTTS2
+) else (
+    echo FireRedTTS2 already cloned.
+)
+
+if not exist libs\fish-speech (
+    echo Cloning fish-speech...
+    git clone https://github.com/fishaudio/fish-speech.git libs\fish-speech
+    call .venv\Scripts\pip install -e libs\fish-speech
+) else (
+    echo fish-speech already cloned.
+)
 
 echo.
 echo ==============================================
