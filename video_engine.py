@@ -19,6 +19,18 @@ from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import sys
+import contextlib
+
+@contextlib.contextmanager
+def suppress_stdout():
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +95,8 @@ class VideoEngine:
         self.tile_size     = int(cfg.get("tile_size",   800))
         self.tile_pad      = int(cfg.get("tile_pad",    10))
         self.use_half      = bool(cfg.get("use_half_precision", True))
-        self.io_prefetch   = int(cfg.get("io_prefetch", 12))
-        self.write_workers = int(cfg.get("write_workers", 4))
+        self.io_prefetch   = int(cfg.get("io_prefetch", 3))
+        self.write_workers = int(cfg.get("write_workers", 2))
         model_path_str = cfg.get("upscale_model_path", "./weights/RealESRGAN_x4plus.pth")
         if model_path_str.startswith("./"):
             self.model_path = str(Path(__file__).parent / model_path_str[2:])
@@ -152,18 +164,6 @@ class VideoEngine:
                 torch.backends.cudnn.benchmark = True
                 logger.info("cuDNN benchmark mode enabled.")
 
-            # ── Optimization: torch.compile ───────────────────────────────
-            # Fuses GPU kernels and optimises memory layout.
-            # Typically yields 15-30% speedup on RTX 40-series GPUs.
-            if hasattr(torch, "compile") and self._device == "cuda":
-                try:
-                    self._upscaler.model = torch.compile(
-                        self._upscaler.model, mode="default"
-                    )
-                    logger.info("torch.compile applied to Real-ESRGAN model.")
-                except Exception as exc:
-                    logger.warning("torch.compile unavailable (non-fatal): %s", exc)
-
         else:
             reason = (
                 "Real-ESRGAN weights not found"
@@ -177,37 +177,17 @@ class VideoEngine:
 
     def _calibrate_tile_size(self, sample_bgr: np.ndarray) -> None:
         """
-        Auto-detect optimal tile size by testing the GPU with a real frame.
-
-        Strategy: try tile=0 (process entire frame at once) first. If the
-        GPU has enough VRAM, this eliminates all tiling overhead and is the
-        fastest possible mode. On OOM, fall back to the configured tile size.
+        Auto-detect optimal tile size. We bypass tile=0 testing on Windows 
+        because it tends to hang PyTorch (swaps to system RAM instead of OOM).
+        We just use the configured tile_size.
         """
         if self._upscaler is None:
             self._optimal_tile = self.tile_size
             return
 
-        saved_tile = self._upscaler.tile_size
-
-        # Attempt: No tiling (maximum speed)
-        try:
-            self._upscaler.tile_size = 0
-            logger.info("Calibrating: testing tile=0 (no tiling)...")
-            self._upscaler.enhance(sample_bgr, outscale=4)
-            self._optimal_tile = 0
-            logger.info(
-                "Calibration result: tile=0 (NO TILING) – maximum GPU throughput!"
-            )
-            self._free_vram()
-            return
-        except (CUDA_OOM_EXCEPTION, RuntimeError) as exc:
-            logger.info("Calibration: tile=0 caused OOM (%s)", type(exc).__name__)
-            self._free_vram()
-
-        # Fall back to configured tile size
-        self._upscaler.tile_size = saved_tile
-        self._optimal_tile = saved_tile
-        logger.info("Calibration result: tile=%d", saved_tile)
+        self._optimal_tile = self.tile_size
+        self._upscaler.tile_size = self._optimal_tile
+        logger.info("Using configured tile size: %d", self._optimal_tile)
 
     # ── Public Entry Point ─────────────────────────────────────────────────────
 
@@ -458,9 +438,17 @@ class VideoEngine:
                     self._progress_processed = processed
                     self._progress_failed    = failed
 
-                # Prune completed write futures to prevent unbounded list growth
-                if len(write_futures) > 50:
-                    write_futures = [f for f in write_futures if not f.done()]
+                # Prune completed write futures
+                write_futures = [f for f in write_futures if not f.done()]
+                
+                # Prevent RAM explosion: if the GPU is producing frames faster 
+                # than the CPU can compress them, wait here.
+                if len(write_futures) >= self.write_workers * 2:
+                    import concurrent.futures
+                    concurrent.futures.wait(
+                        write_futures, 
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
 
             # Count frames that failed to load from disk
             failed += len(read_errors)
@@ -484,7 +472,8 @@ class VideoEngine:
     def _upscale_frame(self, bgr: np.ndarray) -> np.ndarray:
         """Run the primary upscaler (Real-ESRGAN or fallback) on a single frame."""
         if self._upscaler is not None:
-            result, _ = self._upscaler.enhance(bgr, outscale=4)
+            with suppress_stdout():
+                result, _ = self._upscaler.enhance(bgr, outscale=4)
             return result
         elif TORCH_AVAILABLE:
             return self._torch_bicubic(bgr)

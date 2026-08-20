@@ -21,6 +21,7 @@ yarn-error.log*
 jobs/
 restored_output/
 weights/
+libs/
 
 # Temporary setup artifacts
 ffmpeg.zip

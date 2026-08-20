@@ -196,7 +196,9 @@ class AudioEngine:
             for ch in range(num_channels):
                 if ai_model:
                     # Mock AI inpainting
-                    repaired[ch] = await self._inpaint_ai_async(ai_model, repaired[ch], gap, sr)
+                    repaired[ch] = await self._inpaint_ai_async(
+                        ai_model, repaired[ch], gap, sr, script_text
+                    )
                 else:
                     repaired[ch] = await self._inpaint_gap_async(repaired[ch], gap, sr)
 
@@ -317,7 +319,7 @@ class AudioEngine:
     # ── Private: Inpainting ───────────────────────────────────────────────────
 
     async def _inpaint_ai_async(
-        self, model, audio: np.ndarray, gap: AudioGap, sr: int
+        self, model, audio: np.ndarray, gap: AudioGap, sr: int, script_text: str
     ) -> np.ndarray:
         """Slice the gap region with surrounding context, pass to AI model, write result back."""
         loop = asyncio.get_event_loop()
@@ -330,7 +332,7 @@ class AudioEngine:
         gap_end_rel = gap.end_sample - pre_start
 
         patched = await loop.run_in_executor(
-            None, model.inpaint_audio, context_audio, sr, gap_start_rel, gap_end_rel
+            None, model.inpaint_audio, context_audio, sr, gap_start_rel, gap_end_rel, script_text
         )
 
         result = audio.copy()

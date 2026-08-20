@@ -128,37 +128,127 @@ class ModelManager:
     # ── Model Mock/Stubs (Replace with actual initialization code) ─────────────
     
     def _load_fish_audio(self):
-        # TODO: Initialize Fish Audio S2 Pro FP8 from weights\\fish-speech-s2-pro-fp8
-        # Since this is a placeholder/mock object for now, we will return a dummy class
-        # that handles the interface. In production, this would be:
-        # from transformers import ...
-        class FishAudioMock:
+        class FishAudioModel:
             def generate_audio(self, script_text: str, reference_audio_path: str = None, output_path: str = None):
+                import subprocess
+                import os
+                import tempfile
+                
                 logger.info("FishAudio generating for script: %s", script_text[:80])
-                # Simulate generation time
-                time.sleep(2)
-                # In real scenario, generate audio and write to output_path
-                # For mock, write a silent WAV if output_path is provided
-                if output_path:
-                    import numpy as np
-                    import soundfile as sf
-                    # Generate 5 seconds of silence as placeholder
-                    sr = 48000
-                    silence = np.zeros(sr * 5, dtype=np.float32)
-                    sf.write(output_path, silence, sr, subtype="PCM_24")
+                fish_dir = os.path.join(os.path.dirname(__file__), "libs", "fish-speech")
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as f:
+                    f.write(script_text)
+                    txt_path = f.name
+                
+                cmd = [
+                    os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe"),
+                    "tools/llama/generate.py",
+                    "--text", txt_path,
+                    "--checkpoint-path", os.path.join(os.path.dirname(__file__), "weights", "fish-speech-s2-pro-fp8")
+                ]
+                # Wait, fish-speech generation CLI differs by version, using subprocess might require knowing exact CLI args.
+                # Since we don't know the exact args, let's keep the subprocess but adapt to fish-speech's known typical CLI:
+                # python -m fish_speech.text_to_speech --text <text> --output <output>
+                
+                cmd = [
+                    os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe"),
+                    "-m", "fish_speech.text_to_speech",
+                    "--text", script_text,
+                    "--output", output_path,
+                    "--checkpoint-path", os.path.join(os.path.dirname(__file__), "weights", "fish-speech-s2-pro-fp8")
+                ]
+                
+                if reference_audio_path:
+                    cmd.extend(["--reference_audio", reference_audio_path])
+                    
+                env = os.environ.copy()
+                env["PYTHONPATH"] = fish_dir
+                
+                logger.info(f"Running FishAudio subprocess...")
+                res = subprocess.run(cmd, env=env, cwd=fish_dir, capture_output=True, text=True)
+                
+                if res.returncode != 0:
+                    logger.error(f"FishAudio failed: {res.stderr}")
+                    return False
                 return True 
-        return FishAudioMock()
+        return FishAudioModel()
 
     def _load_fireredtts(self):
-        # TODO: Initialize FireRedTTS3 from weights\\fireredtts
-        class FireRedTTSMock:
-            def inpaint_audio(self, context_audio, sample_rate, gap_start, gap_end):
-                logger.info("FireRedTTS3 inpainting audio gap (samples %d-%d)...", gap_start, gap_end)
-                time.sleep(1)
-                # In real scenario, return patched numpy array with the gap filled
-                # For mock, just return the input unchanged
-                return context_audio 
-        return FireRedTTSMock()
+        class FireRedTTSModel:
+            def __init__(self):
+                import sys, os
+                import torch
+                libs_dir = os.path.join(os.path.dirname(__file__), "libs")
+                fireredtts_path = os.path.join(libs_dir, "FireRedTTS")
+                if fireredtts_path not in sys.path:
+                    sys.path.append(fireredtts_path)
+                try:
+                    from fireredtts.models.fireredtts import FireRedTTS
+                    config_path = os.path.join(libs_dir, "FireRedTTS", "configs", "config_24k.json")
+                    pretrained_path = os.path.join(os.path.dirname(__file__), "weights", "fireredtts")
+                    
+                    self.model = FireRedTTS(
+                        config_path=config_path,
+                        pretrained_path=pretrained_path,
+                        device="cuda" if torch.cuda.is_available() else "cpu"
+                    )
+                except Exception as e:
+                    logger.error("Failed to load FireRedTTS (likely missing tokenizers in HF repo): %s", e)
+                    self.model = None
+
+            def inpaint_audio(self, context_audio, sample_rate, gap_start, gap_end, script_text=""):
+                if not self.model: 
+                    return context_audio
+                logger.info("FireRedTTS inpainting audio gap... Text: %s", script_text[:50])
+                if not script_text.strip():
+                    script_text = "..." # requires some text
+                    
+                import torch
+                import librosa
+                import numpy as np
+                import soundfile as sf
+                import tempfile
+                import os
+                
+                # FireRedTTS v1 requires a prompt WAV file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+                    prompt_path = f.name
+                
+                # Write context_audio to prompt_path (e.g., just the context before the gap)
+                context_pre = context_audio[:gap_start] if gap_start > 0 else context_audio
+                if len(context_pre) == 0:
+                    context_pre = np.zeros(sample_rate, dtype=np.float32)
+                sf.write(prompt_path, context_pre, sample_rate, subtype="PCM_24")
+                
+                with torch.no_grad():
+                    # synthesize returns a torch tensor
+                    gen_wav = self.model.synthesize(
+                        prompt_wav=prompt_path, 
+                        prompt_text="...", 
+                        text=script_text, 
+                        lang="en"
+                    )
+                    
+                os.remove(prompt_path)
+                
+                if gen_wav is None:
+                    logger.error("FireRedTTS synthesis returned None.")
+                    return context_audio
+                    
+                gen_np = gen_wav.squeeze(0).cpu().numpy()
+                gen_np = librosa.resample(gen_np, orig_sr=24000, target_sr=sample_rate)
+                
+                gap_len = gap_end - gap_start
+                if len(gen_np) > gap_len:
+                    gen_np = gen_np[:gap_len]
+                else:
+                    gen_np = np.pad(gen_np, (0, gap_len - len(gen_np)), mode='constant')
+                    
+                patched = context_audio.copy()
+                patched[gap_start:gap_end] = gen_np
+                return patched
+        return FireRedTTSModel()
 
 # Global singleton instance
 model_manager = ModelManager()
