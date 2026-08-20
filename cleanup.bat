@@ -64,6 +64,14 @@ if exist restored_output (
     rmdir /s /q restored_output
     echo Done.
 )
+if exist libs (
+    rmdir /s /q libs
+    echo Done.
+)
+if exist __pycache__ (
+    rmdir /s /q __pycache__
+    echo Done.
+)
 
 echo.
 echo ==============================================

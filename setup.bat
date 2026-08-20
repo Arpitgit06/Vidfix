@@ -17,10 +17,18 @@ if not exist .venv\Scripts\python.exe (
     echo Virtual Environment already exists.
 )
 
-:: 2. Setup PyTorch and Dependencies
+:: 2. Upgrade pip first (old pip can't resolve PyTorch dependencies)
 echo.
-echo [2/5] Installing PyTorch with CUDA 12.1...
-call .venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+echo [2/6] Upgrading pip...
+call .venv\Scripts\python -m pip install --upgrade pip
+if %ERRORLEVEL% neq 0 (
+    echo Warning: Failed to upgrade pip. Continuing anyway...
+)
+
+:: 3. Setup PyTorch and Dependencies
+echo.
+echo [3/6] Installing PyTorch with CUDA 12.1...
+call .venv\Scripts\pip install torch==2.8.0 torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu121
 if %ERRORLEVEL% neq 0 (
     echo Error: Failed to install PyTorch.
     pause
@@ -52,6 +60,12 @@ if not exist weights\RealESRGAN_x4plus.pth (
     )
 ) else (
     echo Model weights already present.
+)
+
+echo Exporting PyTorch model to ONNX for TensorRT acceleration...
+call .venv\Scripts\python export_onnx.py
+if %ERRORLEVEL% neq 0 (
+    echo Warning: Failed to export ONNX model.
 )
 
 :: 3. Setup AI Audio Model Weights (Hugging Face)
