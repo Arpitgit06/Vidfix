@@ -27,12 +27,28 @@ if %ERRORLEVEL% neq 0 (
 
 :: 3. Setup PyTorch and Dependencies
 echo.
-echo [3/6] Installing PyTorch with CUDA 12.1...
-call .venv\Scripts\pip install torch==2.8.0 torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu121
+echo [3/6] Detecting GPU and installing PyTorch...
+
+:: Auto-detect NVIDIA GPU for correct PyTorch variant
+nvidia-smi >nul 2>nul
+if %ERRORLEVEL% equ 0 (
+    echo NVIDIA GPU detected. Installing PyTorch with CUDA 12.8...
+    call .venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+) else (
+    echo No NVIDIA GPU detected. Installing CPU-only PyTorch...
+    call .venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+)
 if %ERRORLEVEL% neq 0 (
     echo Error: Failed to install PyTorch.
     pause
     exit /b %ERRORLEVEL%
+)
+
+:: Verify PyTorch installation
+echo Verifying PyTorch installation...
+call .venv\Scripts\python -c "import torch; cuda = torch.cuda.is_available(); print(f'PyTorch {torch.__version__} | CUDA: {cuda}'); assert '+cpu' not in torch.__version__ or not cuda, 'Mismatch'" 2>nul
+if %ERRORLEVEL% neq 0 (
+    echo Warning: PyTorch verification had issues. Check manually with: .venv\Scripts\python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 )
 
 echo.
@@ -127,12 +143,12 @@ if not exist libs (
     mkdir libs
 )
 
-if not exist libs\FireRedTTS2 (
-    echo Cloning FireRedTTS2...
-    git clone https://github.com/FireRedTeam/FireRedTTS2.git libs\FireRedTTS2
-    call .venv\Scripts\pip install -e libs\FireRedTTS2
+if not exist libs\FireRedTTS (
+    echo Cloning FireRedTTS...
+    git clone https://github.com/FireRedTeam/FireRedTTS.git libs\FireRedTTS
+    call .venv\Scripts\pip install -e libs\FireRedTTS
 ) else (
-    echo FireRedTTS2 already cloned.
+    echo FireRedTTS already cloned.
 )
 
 if not exist libs\fish-speech (

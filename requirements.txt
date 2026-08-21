@@ -1,8 +1,10 @@
 # AV-SynthRestore 3D – Python Backend Dependencies
 # Install with: pip install -r requirements.txt
 #
-# GPU-accelerated inference (CUDA):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# GPU-accelerated inference (CUDA 12.8):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#   IMPORTANT: Use --index-url (NOT --extra-index-url) to prevent pip
+#              from pulling the CPU-only build from PyPI.
 #
 # Real-ESRGAN (optional but recommended for true 4K upscaling):
 #   pip install realesrgan basicsr
@@ -13,6 +15,13 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9        # Required for UploadFile/File()
+websockets==12.0
+
+# ── TensorRT ONNX Dependencies ────────────────────────────────────────────────
+onnx
+onnxruntime-gpu
+tensorrt
+protobuf>=4.25.1
 
 # ── Audio Processing ───────────────────────────────────────────────────────────
 librosa==0.10.2
