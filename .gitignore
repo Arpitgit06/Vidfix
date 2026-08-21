@@ -26,6 +26,13 @@ libs/
 # Temporary setup artifacts
 ffmpeg.zip
 ffmpeg_temp/
+ffmpeg.exe
+ffprobe.exe
+ffplay.exe
+
+# Model Cache / TensorRT
+*.engine
+
 
 # OS/IDE files
 .DS_Store
