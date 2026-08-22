@@ -191,9 +191,10 @@ class ProcessingPipeline:
                     config=self.config.get("video"),
                     telemetry_callback=self._make_branch_callback("video"),
                 )
+                upscaled_video_path = self.temp_dir / "temp_upscaled.mp4"
                 tasks.append(("video", video_engine.process(
                     str(self.frames_dir),
-                    str(self.upscaled_frames_dir),
+                    str(upscaled_video_path),
                     fps,
                     total_frames,
                 )))
@@ -228,8 +229,8 @@ class ProcessingPipeline:
                 self._ffmpeg_remux,
                 has_video,
                 has_audio,
+                upscaled_video_path if has_video else None,
                 self.temp_dir / "repaired_audio.wav" if has_audio else None,
-                fps,
                 str(output_path),
             )
 
@@ -341,7 +342,7 @@ class ProcessingPipeline:
             (
                 ffmpeg
                 .input(str(input_path))
-                .output(pattern, vsync="0", an=None)  # no audio stream
+                .output(pattern, fps_mode="passthrough", an=None)  # no audio stream
                 .overwrite_output()
                 .run(capture_stdout=True, capture_stderr=True)
             )
@@ -354,19 +355,16 @@ class ProcessingPipeline:
         self,
         has_video:    bool,
         has_audio:    bool,
+        video_path:   Optional[Path],
         audio_path:   Optional[Path],
-        fps:          float,
         output_path:  str,
     ) -> None:
         """
-        Combine upscaled frames (PNG sequence) + repaired WAV → H.264/AAC MP4.
+        Combine upscaled NVENC MP4 + repaired WAV → H.264/AAC MP4.
         Handles video-only, audio-only, and combined cases.
         """
         video_enc_opts = dict(
-            vcodec="libx264",
-            crf=self.config["video"].get("encoder_crf", 18),
-            preset=self.config["video"].get("encoder_preset", "slow"),
-            pix_fmt="yuv420p",
+            vcodec="copy",
             movflags="+faststart",
         )
         audio_enc_opts = dict(
@@ -375,11 +373,8 @@ class ProcessingPipeline:
         )
 
         try:
-            if has_video and has_audio and audio_path:
-                frame_pattern = str(self.upscaled_frames_dir / "frame_%06d.png")
-                vid_in  = ffmpeg.input(
-                    frame_pattern, framerate=fps, pattern_type="sequence"
-                )
+            if has_video and has_audio and video_path and audio_path:
+                vid_in  = ffmpeg.input(str(video_path))
                 aud_in  = ffmpeg.input(str(audio_path))
                 (
                     ffmpeg
@@ -389,11 +384,8 @@ class ProcessingPipeline:
                     .run(capture_stdout=True, capture_stderr=True)
                 )
 
-            elif has_video:
-                frame_pattern = str(self.upscaled_frames_dir / "frame_%06d.png")
-                vid_in = ffmpeg.input(
-                    frame_pattern, framerate=fps, pattern_type="sequence"
-                )
+            elif has_video and video_path:
+                vid_in = ffmpeg.input(str(video_path))
                 (
                     ffmpeg
                     .output(vid_in, output_path, **video_enc_opts, an=None)

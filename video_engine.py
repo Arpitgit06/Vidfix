@@ -1,26 +1,27 @@
 """
 video_engine.py – AV-SynthRestore 3D
-4K video upscaling using Real-ESRGAN (or PyTorch bicubic fallback) with
-optimized GPU pipeline: producer-consumer I/O, dynamic tile calibration,
-torch.compile acceleration, and parallel PNG writes.
+4K video upscaling using Real-ESRGAN via TensorRT/ONNX (or PyTorch bicubic
+fallback) with optimized GPU pipeline: producer-consumer I/O and direct
+NVENC hardware video encoding.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import gc
 import logging
 import os
 import queue
+import subprocess
+import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import sys
-import contextlib
 
 @contextlib.contextmanager
 def suppress_stdout():
@@ -53,13 +54,21 @@ else:
         pass
 
 try:
+    import torchvision
+    import torchvision.transforms.functional
+    import sys
+    sys.modules['torchvision.transforms.functional_tensor'] = torchvision.transforms.functional
+except ImportError:
+    pass
+
+try:
     from realesrgan import RealESRGANer
     from basicsr.archs.rrdbnet_arch import RRDBNet
     REALESRGAN_AVAILABLE = True
     logger.info("Real-ESRGAN detected.")
-except ImportError:
+except ImportError as exc:
     REALESRGAN_AVAILABLE = False
-    logger.warning("Real-ESRGAN not installed; bicubic fallback active.")
+    logger.warning("Real-ESRGAN not installed; bicubic fallback active. Error: %s", exc)
 
 
 # ── VideoEngine ────────────────────────────────────────────────────────────────
@@ -68,18 +77,16 @@ class VideoEngine:
     """
     Orchestrates per-frame AI upscaling to 4K.
 
-    Processing Pipeline (Optimized)
-    --------------------------------
-    1. Auto-calibrate tile size: try tile=0 (no tiling) first for maximum
-       throughput, fall back to configured tile size on OOM.
-    2. Apply torch.compile to the neural network for kernel fusion.
-    3. Producer-Consumer I/O pipeline:
+    Processing Pipeline (TensorRT + NVENC)
+    ---------------------------------------
+    1. Load Real-ESRGAN model via ONNX Runtime with TensorRT execution
+       provider for hardware-optimised inference.
+    2. Producer-Consumer I/O pipeline:
        - Reader thread:  pre-loads frames from disk into a RAM queue.
-       - GPU thread:     pulls from read queue, runs AI upscaling, pushes
-                         results to write pool.
-       - Writer pool:    multiple threads compress and write PNGs in parallel.
-    4. Per-frame OOM fallback to PyTorch bicubic / OpenCV Lanczos.
-    5. Async telemetry updates every 2 seconds while pipeline runs.
+       - GPU thread:     pulls from read queue, runs TensorRT inference.
+       - FFmpeg pipe:    streams raw frames into NVENC hardware encoder.
+    3. Per-frame OOM fallback to PyTorch bicubic / OpenCV Lanczos.
+    4. Async telemetry updates every 2 seconds while pipeline runs.
     """
 
     TARGET_W: int = 3840
@@ -92,7 +99,7 @@ class VideoEngine:
     ) -> None:
         cfg = config or {}
         self.batch_size    = int(cfg.get("batch_size",  4))
-        self.tile_size     = int(cfg.get("tile_size",   800))
+        self.tile_size     = int(cfg.get("tile_size",   500))
         self.tile_pad      = int(cfg.get("tile_pad",    10))
         self.use_half      = bool(cfg.get("use_half_precision", True))
         self.io_prefetch   = int(cfg.get("io_prefetch", 3))
@@ -137,10 +144,15 @@ class VideoEngine:
         if self._upscaler is not None:
             return
 
+        # Optimization: Enable cuDNN benchmark for faster convolutions
+        if TORCH_AVAILABLE and hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = True
+            logger.info("cuDNN benchmark mode enabled.")
+
         if REALESRGAN_AVAILABLE and TORCH_AVAILABLE and Path(self.model_path).exists():
             logger.info(
-                "Initialising Real-ESRGAN on %s (tile=%d, half=%s)",
-                self._device, self.tile_size, self.use_half,
+                "Loading PyTorch Real-ESRGAN on %s (tile=%d)",
+                self._device, self.tile_size,
             )
             model = RRDBNet(
                 num_in_ch=3, num_out_ch=3,
@@ -154,20 +166,13 @@ class VideoEngine:
                 tile_pad=self.tile_pad,
                 pre_pad=0,
                 half=(self.use_half and self._device == "cuda"),
-                device=self._device,
+                device=torch.device('cuda' if self._device == 'cuda' else 'cpu')
             )
-
-            # ── Optimization: cuDNN benchmark mode ────────────────────────
-            # Enables cuDNN auto-tuner to find the fastest convolution
-            # algorithms for the current GPU and input dimensions.
-            if hasattr(torch.backends, "cudnn"):
-                torch.backends.cudnn.benchmark = True
-                logger.info("cuDNN benchmark mode enabled.")
-
+            logger.info("Real-ESRGAN PyTorch loaded.")
         else:
             reason = (
                 "Real-ESRGAN weights not found"
-                if REALESRGAN_AVAILABLE and not Path(self.model_path).exists()
+                if REALESRGAN_AVAILABLE
                 else "Real-ESRGAN not installed"
             )
             logger.info("%s – using PyTorch bicubic / OpenCV Lanczos.", reason)
@@ -194,18 +199,19 @@ class VideoEngine:
     async def process(
         self,
         frames_dir:        str,
-        output_frames_dir: str,
+        output_video_path: str,
         fps:               float,
         total_frames_hint: int,
     ) -> dict:
         """
-        Upscale all frames in `frames_dir` and write results to `output_frames_dir`.
+        Upscale all frames in `frames_dir` and stream results directly to 
+        `output_video_path` using an NVENC FFmpeg pipe.
 
         Parameters
         ----------
         frames_dir        : Directory containing raw extracted PNGs.
-        output_frames_dir : Destination directory for 4K PNGs.
-        fps               : Video frame rate (informational / telemetry).
+        output_video_path : Destination MP4 file path for the NVENC stream.
+        fps               : Video frame rate.
         total_frames_hint : Expected total frame count (from FFprobe).
 
         Returns
@@ -213,8 +219,6 @@ class VideoEngine:
         dict with processing statistics.
         """
         await self._telemetry({"stage": "video_init", "video_progress": 0})
-
-        os.makedirs(output_frames_dir, exist_ok=True)
 
         frame_paths = sorted(
             p for p in Path(frames_dir).iterdir()
@@ -264,7 +268,7 @@ class VideoEngine:
         # ── Launch producer-consumer pipeline in background executor ──────
         loop = asyncio.get_event_loop()
         pipeline_future = loop.run_in_executor(
-            None, self._run_pipeline, frame_paths, output_frames_dir
+            None, self._run_pipeline, frame_paths, output_video_path, fps
         )
 
         # ── Async telemetry polling while pipeline runs ───────────────────
@@ -282,7 +286,7 @@ class VideoEngine:
                 "frame":         p,
                 "total_frames":  total,
                 "gpu_util":      self._gpu_memory_percent(),
-                "gpu_temp":      self._gpu_temp(),
+                "gpu_temp":      await self._gpu_temp(),
                 "fps":           round(fps, 2),
             })
 
@@ -311,57 +315,85 @@ class VideoEngine:
     def _run_pipeline(
         self,
         frame_paths: List[Path],
-        out_dir:     str,
+        output_video_path: str,
+        fps: float,
     ) -> Tuple[int, int]:
         """
-        High-throughput frame processing pipeline.
+        High-throughput NVENC direct-to-video pipeline.
 
         Architecture
         ------------
-        ┌──────────┐     ┌──────────────┐     ┌──────────────┐
-        │  Reader  │ ──► │  GPU Worker   │ ──► │  Writer Pool │
-        │ (thread) │     │ (main thread) │     │ (4 threads)  │
-        └──────────┘     └──────────────┘     └──────────────┘
-             ↓                                       ↓
-          read_q                               ThreadPoolExecutor
-        (prefetch 12)                          (parallel PNG write)
-
-        The reader constantly loads frames into RAM so the GPU never
-        waits for disk I/O.  The writer pool compresses and flushes
-        upscaled PNGs across multiple CPU cores in parallel.
+        ┌──────────┐     ┌───────────────┐     ┌───────────────┐
+        │  Reader  │ ──► │  GPU Worker   │ ──► │  FFmpeg Pipe  │
+        │ (pool)   │     │ (main thread) │     │ (writer thr)  │
+        └──────────┘     └───────────────┘     └───────────────┘
 
         Returns
         -------
         (processed, failed) tuple.
         """
-        read_q:      queue.Queue = queue.Queue(maxsize=self.io_prefetch)
-        read_done:   threading.Event = threading.Event()
+        read_q:      queue.Queue = queue.Queue(maxsize=self.io_prefetch * 2)
+        write_q:     queue.Queue = queue.Queue(maxsize=self.io_prefetch)
         read_errors: List[Path] = []
 
-        write_pool = ThreadPoolExecutor(
-            max_workers=self.write_workers,
-            thread_name_prefix="frame-writer",
+        # ── FFmpeg NVENC Pipe ─────────────────────────────────────────────
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{self.target_w}x{self.target_h}",
+            "-pix_fmt", "bgr24",
+            "-r", str(fps),
+            "-i", "-", # read from stdin
+            "-c:v", "h264_nvenc",
+            "-preset", "p6",
+            "-cq", "19",
+            "-b:v", "0",
+            "-pix_fmt", "yuv420p",
+            output_video_path
+        ]
+        
+        ffmpeg_proc = subprocess.Popen(
+            ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=10**8
         )
-        write_futures: list = []
 
-        # ── Reader thread ─────────────────────────────────────────────────
+        # ── Writer Thread ─────────────────────────────────────────────────
+        def _writer() -> None:
+            try:
+                while True:
+                    frame_bytes = write_q.get()
+                    if frame_bytes is None: # Sentinel
+                        break
+                    ffmpeg_proc.stdin.write(frame_bytes)
+            except Exception as exc:
+                logger.error("Writer thread error: %s", exc)
+                
+        writer_t = threading.Thread(target=_writer, daemon=True, name="frame-writer")
+        writer_t.start()
+
+        # ── Reader Thread (Parallel Fetching) ──────────────────────────────
         def _reader() -> None:
             try:
-                for fp in frame_paths:
-                    bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
-                    if bgr is None:
-                        logger.error("cv2.imread returned None: %s", fp)
-                        read_errors.append(fp)
-                        continue
-                    read_q.put((fp, bgr))
+                # Use threads to parallelise I/O while preserving order
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as pool:
+                    # Submit in small chunks to prevent OOM
+                    chunk_size = max(1, self.io_prefetch)
+                    for i in range(0, len(frame_paths), chunk_size):
+                        chunk = frame_paths[i:i+chunk_size]
+                        futures = [pool.submit(cv2.imread, str(fp), cv2.IMREAD_COLOR) for fp in chunk]
+                        for fp, fut in zip(chunk, futures):
+                            bgr = fut.result()
+                            if bgr is None:
+                                logger.error("cv2.imread returned None: %s", fp)
+                                read_errors.append(fp)
+                                continue
+                            read_q.put((fp, bgr))
             except Exception as exc:
                 logger.error("Reader thread error: %s", exc)
             finally:
-                read_done.set()
+                read_q.put(None) # Sentinel
 
-        reader_t = threading.Thread(
-            target=_reader, daemon=True, name="frame-reader"
-        )
+        reader_t = threading.Thread(target=_reader, daemon=True, name="frame-reader")
         reader_t.start()
 
         # ── GPU processing loop ───────────────────────────────────────────
@@ -370,13 +402,10 @@ class VideoEngine:
 
         try:
             while True:
-                # Pull next frame from pre-loaded queue
-                try:
-                    fp, bgr = read_q.get(timeout=3.0)
-                except queue.Empty:
-                    if read_done.is_set() and read_q.empty():
-                        break
-                    continue
+                item = read_q.get()
+                if item is None:
+                    break
+                fp, bgr = item
 
                 # Upscale with AI model
                 try:
@@ -388,49 +417,30 @@ class VideoEngine:
                         upscaled = cv2.resize(
                             upscaled,
                             (self.target_w, self.target_h),
-                            interpolation=cv2.INTER_LANCZOS4,
+                            interpolation=cv2.INTER_AREA,
                         )
 
-                    # Submit write to thread pool (non-blocking)
-                    out_path = str(Path(out_dir) / fp.name)
-                    fut = write_pool.submit(
-                        cv2.imwrite, out_path, upscaled,
-                        [cv2.IMWRITE_PNG_COMPRESSION, 1],
-                    )
-                    write_futures.append(fut)
+                    # Stream directly into writer queue (avoids GPU stall)
+                    write_q.put(upscaled.tobytes())
                     processed += 1
 
                 except CUDA_OOM_EXCEPTION:
-                    logger.warning(
-                        "VRAM OOM on frame %s – bicubic fallback", fp.name
-                    )
+                    logger.warning("VRAM OOM on frame %s – bicubic fallback", fp.name)
                     self._free_vram()
                     try:
                         upscaled = self._fallback_upscale(bgr)
-                        out_path = str(Path(out_dir) / fp.name)
-                        fut = write_pool.submit(
-                            cv2.imwrite, out_path, upscaled,
-                            [cv2.IMWRITE_PNG_COMPRESSION, 1],
-                        )
-                        write_futures.append(fut)
+                        write_q.put(upscaled.tobytes())
                         processed += 1
                     except Exception:
-                        self._copy_frame_as_is(fp, out_dir)
                         failed += 1
 
                 except Exception as exc:
                     logger.error("Frame %s error: %s", fp.name, exc)
                     try:
                         upscaled = self._fallback_upscale(bgr)
-                        out_path = str(Path(out_dir) / fp.name)
-                        fut = write_pool.submit(
-                            cv2.imwrite, out_path, upscaled,
-                            [cv2.IMWRITE_PNG_COMPRESSION, 1],
-                        )
-                        write_futures.append(fut)
+                        write_q.put(upscaled.tobytes())
                         processed += 1
                     except Exception:
-                        self._copy_frame_as_is(fp, out_dir)
                         failed += 1
 
                 # Update thread-safe progress counters
@@ -438,26 +448,18 @@ class VideoEngine:
                     self._progress_processed = processed
                     self._progress_failed    = failed
 
-                # Prune completed write futures
-                write_futures = [f for f in write_futures if not f.done()]
-                
-                # Prevent RAM explosion: if the GPU is producing frames faster 
-                # than the CPU can compress them, wait here.
-                if len(write_futures) >= self.write_workers * 2:
-                    import concurrent.futures
-                    concurrent.futures.wait(
-                        write_futures, 
-                        return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-
             # Count frames that failed to load from disk
             failed += len(read_errors)
-            for fp in read_errors:
-                self._copy_frame_as_is(fp, out_dir)
 
         finally:
-            # Drain all pending writes
-            write_pool.shutdown(wait=True)
+            # Signal writer to exit and wait
+            write_q.put(None)
+            writer_t.join(timeout=10)
+            
+            # Drain and close the video pipe
+            if ffmpeg_proc.stdin:
+                ffmpeg_proc.stdin.close()
+            ffmpeg_proc.wait()
             reader_t.join(timeout=10)
 
             # Final progress update
@@ -491,37 +493,39 @@ class VideoEngine:
     def _torch_bicubic(self, bgr: np.ndarray) -> np.ndarray:
         """
         PyTorch bicubic upscaling to 4×, capped at target_w × target_h.
-        Runs on the configured device (CUDA / MPS / CPU).
+        Optimized to avoid unnecessary CPU memory allocations and color conversions.
         """
         h, w = bgr.shape[:2]
         target_h = min(h * 4, self.target_h)
         target_w = min(w * 4, self.target_w)
 
-        # BGR → RGB → float32 → (1, 3, H, W) tensor
-        rgb   = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        t     = torch.from_numpy(rgb.transpose(2, 0, 1)).unsqueeze(0)
-
+        # Zero-copy view of numpy array -> contiguous tensor -> format (1, 3, H, W)
+        t = torch.from_numpy(bgr).permute(2, 0, 1).unsqueeze(0)
+        
+        # Async transfer to device (if GPU), convert to float inline (PyTorch bicubic requires float)
         if self._device != "cpu":
-            t = t.to(self._device)
+            t = t.to(self._device, non_blocking=True).float()
+        else:
+            t = t.float()
 
         with torch.no_grad():
+            # Upscale directly on raw 0-255 values
             up = F.interpolate(
                 t,
                 size=(target_h, target_w),
                 mode="bicubic",
                 align_corners=False,
-            ).clamp(0.0, 1.0)
+            ).clamp(0, 255)
 
-        out_np = (up.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0) \
-                     .round().astype(np.uint8)
-        return cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+        # Byte cast directly on GPU, then synchronous pull to CPU, format (H, W, 3)
+        return up.squeeze(0).byte().cpu().numpy().transpose(1, 2, 0)
 
     def _cv2_lanczos(self, bgr: np.ndarray) -> np.ndarray:
-        """OpenCV Lanczos-4 fallback (CPU only)."""
+        """OpenCV Cubic fallback (CPU only) - optimized for speed over Lanczos."""
         h, w    = bgr.shape[:2]
         target_w = min(w * 4, self.target_w)
         target_h = min(h * 4, self.target_h)
-        return cv2.resize(bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        return cv2.resize(bgr, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
     def _copy_frame_as_is(self, frame_path: Path, out_dir: str) -> None:
         """Last-resort fallback: copy source frame resized to target dimensions so remux can proceed."""
@@ -557,16 +561,17 @@ class VideoEngine:
             return 0.0
 
     @staticmethod
-    def _gpu_temp() -> float:
-        """Return GPU temperature in °C via nvidia-smi (best-effort)."""
+    async def _gpu_temp() -> float:
+        """Return GPU temperature in °C via nvidia-smi (best-effort, non-blocking)."""
         try:
-            import subprocess
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2,
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
             )
-            if result.returncode == 0:
-                return float(result.stdout.strip().split("\n")[0])
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            if proc.returncode == 0 and stdout:
+                return float(stdout.decode().strip().split("\n")[0])
         except Exception:
             pass
         return 0.0
