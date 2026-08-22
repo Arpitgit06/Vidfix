@@ -130,48 +130,37 @@ class ModelManager:
     def _load_fish_audio(self):
         class FishAudioModel:
             def generate_audio(self, script_text: str, reference_audio_path: str = None, output_path: str = None):
-                import subprocess
+                import sys
                 import os
-                import tempfile
+                import runpy
                 
                 logger.info("FishAudio generating for script: %s", script_text[:80])
                 fish_dir = os.path.join(os.path.dirname(__file__), "libs", "fish-speech")
                 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as f:
-                    f.write(script_text)
-                    txt_path = f.name
-                
-                cmd = [
-                    os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe"),
-                    "tools/llama/generate.py",
-                    "--text", txt_path,
-                    "--checkpoint-path", os.path.join(os.path.dirname(__file__), "weights", "fish-speech-s2-pro-fp8")
-                ]
-                # Wait, fish-speech generation CLI differs by version, using subprocess might require knowing exact CLI args.
-                # Since we don't know the exact args, let's keep the subprocess but adapt to fish-speech's known typical CLI:
-                # python -m fish_speech.text_to_speech --text <text> --output <output>
-                
-                cmd = [
-                    os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe"),
-                    "-m", "fish_speech.text_to_speech",
-                    "--text", script_text,
-                    "--output", output_path,
-                    "--checkpoint-path", os.path.join(os.path.dirname(__file__), "weights", "fish-speech-s2-pro-fp8")
-                ]
-                
-                if reference_audio_path:
-                    cmd.extend(["--reference_audio", reference_audio_path])
+                if fish_dir not in sys.path:
+                    sys.path.insert(0, fish_dir)
                     
-                env = os.environ.copy()
-                env["PYTHONPATH"] = fish_dir
-                
-                logger.info(f"Running FishAudio subprocess...")
-                res = subprocess.run(cmd, env=env, cwd=fish_dir, capture_output=True, text=True)
-                
-                if res.returncode != 0:
-                    logger.error(f"FishAudio failed: {res.stderr}")
+                old_argv = sys.argv.copy()
+                try:
+                    sys.argv = [
+                        "text_to_speech.py",
+                        "--text", script_text,
+                        "--output", output_path,
+                        "--checkpoint-path", os.path.join(os.path.dirname(__file__), "weights", "fish-speech-s2-pro-fp8")
+                    ]
+                    if reference_audio_path:
+                        sys.argv.extend(["--reference_audio", reference_audio_path])
+                        
+                    logger.info("Running FishAudio via runpy in-memory execution...")
+                    import torch
+                    with torch.inference_mode():
+                        runpy.run_module("fish_speech.text_to_speech", run_name="__main__")
+                    return True
+                except Exception as e:
+                    logger.error("FishAudio runpy execution failed: %s", e)
                     return False
-                return True 
+                finally:
+                    sys.argv = old_argv 
         return FishAudioModel()
 
     def _load_fireredtts(self):
@@ -193,6 +182,10 @@ class ModelManager:
                         pretrained_path=pretrained_path,
                         device="cuda" if torch.cuda.is_available() else "cpu"
                     )
+                    # Attempt FP16 quantization for VRAM reduction
+                    if torch.cuda.is_available() and hasattr(self.model, "half"):
+                        self.model.half()
+                        logger.info("FireRedTTS loaded in FP16 precision.")
                 except Exception as e:
                     logger.error("Failed to load FireRedTTS (likely missing tokenizers in HF repo): %s", e)
                     self.model = None
@@ -221,14 +214,16 @@ class ModelManager:
                     context_pre = np.zeros(sample_rate, dtype=np.float32)
                 sf.write(prompt_path, context_pre, sample_rate, subtype="PCM_24")
                 
-                with torch.no_grad():
-                    # synthesize returns a torch tensor
-                    gen_wav = self.model.synthesize(
-                        prompt_wav=prompt_path, 
-                        prompt_text="...", 
-                        text=script_text, 
-                        lang="en"
-                    )
+                import contextlib
+                with torch.inference_mode():
+                    with torch.autocast("cuda", dtype=torch.float16) if torch.cuda.is_available() else contextlib.nullcontext():
+                        # synthesize returns a torch tensor
+                        gen_wav = self.model.synthesize(
+                            prompt_wav=prompt_path, 
+                            prompt_text="...", 
+                            text=script_text, 
+                            lang="en"
+                        )
                     
                 os.remove(prompt_path)
                 
