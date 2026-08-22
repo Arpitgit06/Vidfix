@@ -198,9 +198,11 @@ class VideoEngine:
 
     async def process(
         self,
-        frames_dir:        str,
+        input_video_path:  str,
         output_video_path: str,
         fps:               float,
+        orig_w:            int,
+        orig_h:            int,
         total_frames_hint: int,
     ) -> dict:
         """
@@ -220,30 +222,15 @@ class VideoEngine:
         """
         await self._telemetry({"stage": "video_init", "video_progress": 0})
 
-        frame_paths = sorted(
-            p for p in Path(frames_dir).iterdir()
-            if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
-        )
-
-        if not frame_paths:
-            raise FileNotFoundError(f"No frame images found in: {frames_dir}")
-
-        total = len(frame_paths)
+        total = total_frames_hint
         logger.info(
-            "Video upscaling: %d frames, fps=%.2f, device=%s",
+            "Video upscaling: ~%d frames, fps=%.2f, device=%s",
             total, fps, self._device,
         )
 
         # ── Initialise & Calibrate ────────────────────────────────────────
         self._init_upscaler()
-
-        if self._upscaler is not None and frame_paths:
-            sample = cv2.imread(str(frame_paths[0]), cv2.IMREAD_COLOR)
-            if sample is not None:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None, self._calibrate_tile_size, sample
-                )
+        self._calibrate_tile_size(None)
 
         tile_desc = (
             "DISABLED (full-frame)"
@@ -268,7 +255,7 @@ class VideoEngine:
         # ── Launch producer-consumer pipeline in background executor ──────
         loop = asyncio.get_event_loop()
         pipeline_future = loop.run_in_executor(
-            None, self._run_pipeline, frame_paths, output_video_path, fps
+            None, self._run_pipeline, input_video_path, output_video_path, fps, orig_w, orig_h
         )
 
         # ── Async telemetry polling while pipeline runs ───────────────────
@@ -314,9 +301,11 @@ class VideoEngine:
 
     def _run_pipeline(
         self,
-        frame_paths: List[Path],
+        input_video_path: str,
         output_video_path: str,
         fps: float,
+        orig_w: int,
+        orig_h: int,
     ) -> Tuple[int, int]:
         """
         High-throughput NVENC direct-to-video pipeline.
@@ -334,7 +323,7 @@ class VideoEngine:
         """
         read_q:      queue.Queue = queue.Queue(maxsize=self.io_prefetch * 2)
         write_q:     queue.Queue = queue.Queue(maxsize=self.io_prefetch)
-        read_errors: List[Path] = []
+        
 
         # ── FFmpeg NVENC Pipe ─────────────────────────────────────────────
         ffmpeg_cmd = [
@@ -371,23 +360,28 @@ class VideoEngine:
         writer_t = threading.Thread(target=_writer, daemon=True, name="frame-writer")
         writer_t.start()
 
-        # ── Reader Thread (Parallel Fetching) ──────────────────────────────
+        # ── Reader Thread (Zero-Copy FFmpeg Stream) ────────────────────────
+        ffmpeg_dec_cmd = [
+            "ffmpeg", "-i", input_video_path,
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"
+        ]
+        ffmpeg_dec = subprocess.Popen(
+            ffmpeg_dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8
+        )
+        
         def _reader() -> None:
+            frame_size = orig_w * orig_h * 3
+            frame_idx = 0
             try:
-                # Use threads to parallelise I/O while preserving order
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as pool:
-                    # Submit in small chunks to prevent OOM
-                    chunk_size = max(1, self.io_prefetch)
-                    for i in range(0, len(frame_paths), chunk_size):
-                        chunk = frame_paths[i:i+chunk_size]
-                        futures = [pool.submit(cv2.imread, str(fp), cv2.IMREAD_COLOR) for fp in chunk]
-                        for fp, fut in zip(chunk, futures):
-                            bgr = fut.result()
-                            if bgr is None:
-                                logger.error("cv2.imread returned None: %s", fp)
-                                read_errors.append(fp)
-                                continue
-                            read_q.put((fp, bgr))
+                while True:
+                    raw_bytes = ffmpeg_dec.stdout.read(frame_size)
+                    if not raw_bytes or len(raw_bytes) != frame_size:
+                        break
+                    
+                    # Zero-copy parsing direct from buffer
+                    bgr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((orig_h, orig_w, 3))
+                    read_q.put((f"frame_{frame_idx}", bgr))
+                    frame_idx += 1
             except Exception as exc:
                 logger.error("Reader thread error: %s", exc)
             finally:
@@ -425,7 +419,7 @@ class VideoEngine:
                     processed += 1
 
                 except CUDA_OOM_EXCEPTION:
-                    logger.warning("VRAM OOM on frame %s – bicubic fallback", fp.name)
+                    logger.warning("VRAM OOM on frame %s – bicubic fallback", fp)
                     self._free_vram()
                     try:
                         upscaled = self._fallback_upscale(bgr)
@@ -435,7 +429,7 @@ class VideoEngine:
                         failed += 1
 
                 except Exception as exc:
-                    logger.error("Frame %s error: %s", fp.name, exc)
+                    logger.error("Frame %s error: %s", fp, exc)
                     try:
                         upscaled = self._fallback_upscale(bgr)
                         write_q.put(upscaled.tobytes())
@@ -449,7 +443,7 @@ class VideoEngine:
                     self._progress_failed    = failed
 
             # Count frames that failed to load from disk
-            failed += len(read_errors)
+            
 
         finally:
             # Signal writer to exit and wait
@@ -460,6 +454,10 @@ class VideoEngine:
             if ffmpeg_proc.stdin:
                 ffmpeg_proc.stdin.close()
             ffmpeg_proc.wait()
+            
+            if ffmpeg_dec.stdout:
+                ffmpeg_dec.stdout.close()
+            ffmpeg_dec.wait()
             reader_t.join(timeout=10)
 
             # Final progress update

@@ -121,6 +121,8 @@ class ProcessingPipeline:
 
             fps          = self._parse_fps(video_info.get("r_frame_rate", "24/1") if has_video else "0/1")
             total_frames = int(video_info.get("nb_frames", 0)) if has_video else 0
+            orig_w       = int(video_info.get("width", 0)) if has_video else 0
+            orig_h       = int(video_info.get("height", 0)) if has_video else 0
             duration     = float(probe.get("format", {}).get("duration", 0.0))
 
             logger.info(
@@ -152,12 +154,8 @@ class ProcessingPipeline:
                     break
 
             if has_video:
-                await self._tele({"stage": "frame_extraction", "overall_progress": 14})
-                await self._run_in_executor(
-                    self._ffmpeg_extract_frames, input_path
-                )
-                extracted = len(list(self.frames_dir.glob("*.png")))
-                total_frames = extracted if extracted > 0 else total_frames
+                await self._tele({"stage": "frame_extraction_skipped", "overall_progress": 14})
+                # No longer extracting frames to disk; we will stream them directly!
 
             await self._tele({
                 "stage": "demuxed", "overall_progress": 22,
@@ -193,9 +191,11 @@ class ProcessingPipeline:
                 )
                 upscaled_video_path = self.temp_dir / "temp_upscaled.mp4"
                 tasks.append(("video", video_engine.process(
-                    str(self.frames_dir),
+                    str(input_path),
                     str(upscaled_video_path),
                     fps,
+                    orig_w,
+                    orig_h,
                     total_frames,
                 )))
 
@@ -333,22 +333,6 @@ class ProcessingPipeline:
         except ffmpeg.Error as exc:
             raise RuntimeError(
                 f"Audio extraction failed: {exc.stderr.decode(errors='replace')}"
-            ) from exc
-
-    def _ffmpeg_extract_frames(self, input_path: Path) -> None:
-        """Demux all video frames to sequentially numbered PNGs."""
-        pattern = str(self.frames_dir / "frame_%06d.png")
-        try:
-            (
-                ffmpeg
-                .input(str(input_path))
-                .output(pattern, fps_mode="passthrough", an=None)  # no audio stream
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
-            )
-        except ffmpeg.Error as exc:
-            raise RuntimeError(
-                f"Frame extraction failed: {exc.stderr.decode(errors='replace')}"
             ) from exc
 
     def _ffmpeg_remux(
