@@ -8,13 +8,9 @@ INPUT FILE → DEMUXER → ┌── AUDIO REPAIR (FireRedTTS3 Inpainting / Fish
                         │                                                              ├→ REMUXER → OUTPUT 4K MP4
                         └── VIDEO 4K UPSCALE (Real-ESRGAN ×4) ─────────────────────────┘
 ```
-
----
-
 ## Project Structure
 
 All files reside in the root directory for standard execution and configuration:
-
 ```
 av-synthrestore-3d/
 ├── main.py          FastAPI server – REST API + WebSocket telemetry
@@ -34,8 +30,6 @@ av-synthrestore-3d/
 ├── requirements.txt Python dependencies
 └── README.md
 ```
-
----
 
 ## Prerequisites
 
@@ -102,7 +96,6 @@ python main.py
 ### 4. Open the frontend
 
 Navigate to **http://localhost:8765/ui/index.html** in any modern browser.
-
 ---
 
 ## REST API Reference
@@ -126,8 +119,6 @@ curl -s -X POST http://localhost:8765/api/process/$JOB | jq
 # Then open ws://localhost:8765/ws/$JOB for live telemetry
 ```
 
----
-
 ## WebSocket Telemetry Schema
 
 ```jsonc
@@ -150,9 +141,6 @@ curl -s -X POST http://localhost:8765/api/process/$JOB | jq
   "upscaler":             "RealESRGAN"
 }
 ```
-
----
-
 ## Audio Engine — Generative AI & Spectral Inpainting
 
 We've completely overhauled the audio engine to support state-of-the-art AI models, while keeping the classic spectral inpainting as a fallback. 

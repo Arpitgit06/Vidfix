@@ -51,7 +51,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pipeline import ProcessingPipeline
+# Heavy AI modules are lazy-loaded inside background tasks to speed up FastAPI boot.
 
 class ProcessConfig(BaseModel):
     audio_mode: str = "gap_fill"
@@ -452,6 +452,7 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
 async def _pipeline_task(job_id: str) -> None:
     """Runs the full processing pipeline and updates job registry on completion."""
     try:
+        from pipeline import ProcessingPipeline
         entry = _job_registry.get(job_id, {})
         pipeline = ProcessingPipeline(job_id, manager, job_config=entry.get("config"))
         await pipeline.run()
